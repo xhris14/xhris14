@@ -100,3 +100,21 @@ def test_unreadable_slip_reports_the_error_and_re_arms_on_the_next_disturbance()
         eng.feed(empty)
     assert eng.state == IDLE
     assert sum(eng.feed(slip).reading is not None for _ in range(12)) == 1
+
+
+def test_the_update_and_engine_contract_for_the_gui():
+    """Update.fingerprint rides on every emitted reading (and only then); last_fingerprint follows it; forget_last clears it."""
+    from quiniela_scanner import slip_vision as sv
+    slip, empty = _frames()
+    eng = CaptureEngine(9)
+    assert eng.last_fingerprint is None and eng.feed(empty).fingerprint is None
+    ups = [eng.feed(slip) for _ in range(8)]
+    got = [u for u in ups if u.reading is not None]
+    assert len(got) == 1 and isinstance(got[0].fingerprint, sv.Fingerprint) and got[0].fingerprint is eng.last_fingerprint
+    assert all(u.fingerprint is None for u in ups if u.reading is None)
+    manual = eng.capture_now(slip)
+    assert manual.fingerprint is eng.last_fingerprint and manual.fingerprint is not got[0].fingerprint
+    eng.forget_last(rearm=False)
+    assert eng.last_fingerprint is None and eng.state == WAIT_REMOVE            # rearm=False: still waiting for the lift
+    eng.forget_last()
+    assert eng.state == IDLE

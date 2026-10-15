@@ -78,9 +78,17 @@ A slip goes in **at once** only when *all* of these hold; otherwise it opens the
 * every row has one clear mark, or is simply empty (see §4b). Double marks, faint or scribbled marks are shown in red.
 
 **The classic card** (also used when Auto-enter is off or there is no API key): the slip, the detected marks and the name box
-are shown; fix whatever is wrong and press **Enter** to write, **Esc** to discard. While a card is open no further slip is read (the
-next one is picked up as soon as you have finished this one). With `auto_enter_delay_s` above 0 you get the old hands-on
+are shown; fix whatever is wrong and press **Enter** to write, **Esc** to discard. **The camera keeps reading while a card is open**:
+every slip you lift and put down meanwhile waits in a queue and is entered, in order, as soon as you have finished the card. That
+queue is loud, because those tickets are not in Excel yet: an attention beep when the first one queues up, a red bar ("2 slips are
+WAITING behind the card ...") and "slips waiting behind the card: N" in the strip. Slips are never dropped for a card; closing the
+window while the card or the queue still holds slips asks first. With `auto_enter_delay_s` above 0 you get the old hands-on
 mode instead: wait for the name, count down that many seconds (**Esc** cancels), then write.
+
+**Keys:** **Enter** writes the card and **Esc** discards it, but not while you are typing in the Ticket box, the Group-tag box, the
+review name box or a drop-down: there they only finish that entry (Enter / Esc leave it; the next Enter writes the card). **F2**
+switches the tag from anywhere. If a card still shows a row the camera could not read (two marks, faint, scribbled) on "empty" and
+you press Enter, the app asks before writing `F1` for it.
 
 **When the name is not certain** (history rows turn **red**):
 
@@ -101,8 +109,19 @@ until you look, undo what is wrong and tick Auto-enter again. (The switch-off is
 The jornada is the number in the workbook name (`JORNADA 10 PC.xlsx` → 10) unless `expected_jornada` says otherwise.
 
 **Undo last** clears the previous ticket from Excel - also while its name is still being read (the late name is ignored).
-A slip that is lifted and put back is **not** entered twice (the app recognises the pen marks and handwriting); **Capture now**
-reads whatever is there, repeats included. Every entered slip is kept in `scans/` with `log.csv` (see §6).
+A slip that is lifted and put back is **not** entered twice (the app recognises the pen marks and handwriting); each repeat it drops is
+counted (**Skipped repeats: N** in the strip, `DUPLICATE_SKIPPED` in `scanner.log`) and "Same slip still there - lift it off." stays on
+screen while that slip lies there. **Capture now** reads whatever is there, repeats included, so it ignores a second click within
+1.5 s (a double click must not enter the slip twice) and does nothing while a card is open. Every entered slip is kept in `scans/`
+with `log.csv` (see §6).
+
+**Closing the window** waits up to 10 s for names that are still being read, then writes `?` for any that never came back, so every
+slip has its picture and its `log.csv` row. The process exits at once, even if a name request is still hanging.
+
+**Small screens:** the window is sized to the screen (1366x768, 1280x720, Windows display scaling of 125-150 %): the layout gets denser
+and, if it is still too tall, the middle part scrolls while the strip, the history list, **Undo last** and **Next to review** stay in
+view. **Jornada check: 12** (green) next to the group tag says the wrong-jornada guard is on; **Jornada check OFF** (amber) means the
+workbook name has no `jornada <number>` (separators, `No.` and `#` are fine) - set `expected_jornada` in `config.json` then.
 
 ### 4a. Group tags (`RRR`, `E`, …)
 
@@ -140,16 +159,27 @@ Handwriting is where ordinary OCR fails, so the name is read with Claude vision 
 default `claude-opus-5-5`, `claude_effort` low). Only **two small crops** (at most 800 px wide, sent as JPEG) - the printed title
 strip and the NOMBRE strip - are sent, never the whole slip. Cost is a fraction of a cent per slip.
 
-The reads run in a **background pool** (`name_workers`, default 3 at a time), never on the window's thread, so a slow answer
+The reads run in a **background pool** (`name_workers`, default 6 at a time), never on the window's thread, so a slow answer
 cannot hold up the stack. Each request waits at most 25 s (5 s to connect) with one retry, and the app gives up on a slip's
 name `name_timeout_s` (45 s) after its request started (waiting for a free reader does not count) - it then writes `?` and puts
 the slip on the review list. If names regularly queue up
-("names being read" keeps growing in the strip) raise `name_workers`. No key / no internet / `read_names_with_claude: false`
-→ every slip opens the classic card and you type the name.
+("names being read" keeps growing in the strip - it then says "Claude is slower than the stack - raise `name_workers`") raise
+`name_workers`; a name only waits for a free reader without being failed while other names keep coming back.
+
+**No `ANTHROPIC_API_KEY`** / `read_names_with_claude: false` -> every slip opens the classic card and you type the name.
+**The reader stops working in the middle of a stack** (key rejected, no credit, no internet, rate limit, no answer): after 3 such
+failures in a row (or 3 requests silent for half a time-out) one red bar says **NAME READING IS NOT WORKING (reason)**, Auto-enter is
+switched off so each slip waits on the card for you to type the name while it is in your hand, and there is no beep per slip. The picks
+of the slips before that went in as usual, their names are `?` (red rows). The first name that is read correctly again clears the bar
+and ticks Auto-enter again by itself (the switch-off is not saved).
 
 ## 6. Settings (`config.json`, created when you close the app)
 
-`config.json` only contains the settings that differ from the defaults, plus `config_version`. **Upgrading:** a `config.json`
+`config.json` only contains the settings that differ from the defaults, plus `config_version`. It (and `.env`) may be saved by any
+editor: UTF-8 with or without BOM, UTF-16 (what PowerShell's `>` writes) or the Windows ANSI code page. A `config.json` that cannot be
+parsed is **never silently replaced**: it is kept as `config.json.bak` (`.bak2` ...), the window says so in the red bar and uses the
+defaults; a value that cannot work (`matches_per_slip: 0`, a NaN time-out, `camera_index: -3`, `sheets: [1, 2]` ...) falls back to its
+default with a note. **Upgrading:** a `config.json`
 written by an older build (no `config_version`, or older than 2) saved *every* setting, which would pin the old slow defaults; so
 `stable_frames`, `auto_enter_delay_s` and `auto_enter` are dropped when it is read (the window tells you) and everything else is
 kept. Delete the file to start from the defaults.
@@ -167,7 +197,7 @@ kept. Delete the file to start from the defaults.
 | `auto_enter` | hands-free entry (default on) |
 | `auto_enter_delay_s` | `0` (default) = picks go in at once, names follow; above 0 = old mode: wait for the name, then count down this many seconds |
 | `stable_frames` | frames the slip must sit still before it is read (default 4) |
-| `name_workers`, `name_timeout_s` | simultaneous name reads (3) and when to give up on one (45 s) |
+| `name_workers`, `name_timeout_s` | simultaneous name reads (6) and when to give up on one (45 s) |
 | `unsure_marker` | appended to a name Claude was unsure of (`" ?"`; `""` = no marker, the row is still red) |
 | `claude_model`, `claude_effort` | model and effort for the name read |
 | `sounds` | beeps for "entered" / "needs you" (Windows only; default on) |
@@ -179,8 +209,12 @@ kept. Delete the file to start from the defaults.
 
 **`scanner.log`** (next to `config.json`) gets one line per entered slip: time, ticket, `read_ms` (reading the picture),
 `excel_ms`, `name_ms`, status (`ok` / `review` / `wrong` / `undone`), the name written, plus how long the window's thread took
-and the gap since the previous slip - and lines for start-up, Excel/camera problems and the breaker. If the app is slow or
-misbehaves on your PC, send that file.
+and the gap since the previous slip - and lines for start-up, Excel/camera problems, the breaker, `ALERT`s, `DUPLICATE_SKIPPED`,
+`READER_DOWN` / `READER_OK` and `AUDIT_ERROR`. If the app is slow or misbehaves on your PC, send that file.
+
+**`scans/log.csv`** (UTF-8 with BOM, so Excel shows accents right) has one row per entered slip next to its picture. If the file cannot be
+written (typically: it is open in Excel) the rows go to `scans/log-<time>.csv` instead, the red bar says so and nothing is lost; the same
+happens for a full disk (the bar also warns below 1 GB free).
 
 ## 7. Command line
 
@@ -188,7 +222,7 @@ misbehaves on your PC, send that file.
 run.bat                          the scanner window
 run.bat --demo slip.jpg          same, with a photo as the "camera" (it replays the same slip over and over, so use a copy of the workbook)
 run.bat --demo slip.jpg --xlsx pool.xlsx   edit a closed .xlsx file instead of live Excel (this run only, not saved)
-run.bat scan slip.jpg --out r.jpg [--name]   read one photo, print picks (+ name with Claude), save the annotated image
+run.bat scan slip.jpg --out r.jpg [--name]   read one photo, print picks (+ name with Claude), save the annotated image (and r_name.jpg, the name picture)
 run.bat excel                    show how the open workbook was understood
 run.bat cameras                  list webcams
 ```
@@ -204,20 +238,24 @@ run.bat cameras                  list webcams
 | "no 'NOMBRE | 1 2 … 9' header found" | header text differs – set `name_header` / `sheets` in `config.json` |
 | names always need typing | no `ANTHROPIC_API_KEY` in `.env`, or no internet |
 | slips do not enter by themselves | **Auto-enter** must be ticked (a wrong-jornada slip unticks it), a name reader must exist (API key), and `auto_enter_delay_s` must be 0; an old `config.json` is fixed automatically (§6) |
-| the next slip of the stack is not picked up | lift the previous slip completely off the pile, or press **Capture now**; "Same slip still there" means the one that was entered is still on top |
-| names show `?` | open the red rows in the list and type them; `scanner.log` has the reason (no internet, timeout, ...) |
+| the next slip of the stack is not picked up | lift the previous slip completely off the pile, or press **Capture now**; "Same slip still there" means the one that was entered (and not undone) is still on top |
+| names show `?` | open the red rows in the list and type them; `scanner.log` has the reason (no internet, timeout, ...). Many in a row = the red bar "NAME READING IS NOT WORKING" (§5): check the key / credit / internet |
+| red bar "N slips are WAITING behind the card" | finish the open card (Enter / Esc): the waiting slips are entered right after, in order |
+| red bar "AUDIT LOG PROBLEM" | `scans/log.csv` is open in Excel or the disk is full; rows go to `log-<time>.csv`, the slips are in your workbook anyway |
+| the window did not fit my screen | it adapts to 1366x768 and up; the middle part scrolls if needed (mouse wheel) |
 | it feels slow | look at `scanner.log` (`read_ms`, `excel_ms`, `name_ms`, `ui_ms`) or the strip under the preview |
 
 ## 9. What was tested, and what was not
 
-Tested (automated, 233 tests; 17 of them use your real photo and are skipped unless `QUINIELA_REAL_SLIP` points to it): the slip
+Tested (automated - run `pytest`; the tests that use your real photo are skipped unless `QUINIELA_REAL_SLIP` points to it): the slip
 reader on your real photo (all 9 marks, row for row) and on degraded versions of it; the capture engine on 30 fps sequences of whole
 stacks (every slip read exactly once, none twice); the Excel fast path against a stand-in for Excel's object model (one small read +
 one write per slip, no full re-read); and the real window driven end to end: a stack of 8 different slips played at 30 fps (1.1 s
 per slip, and again at 0.63 s per slip) with name answers that take random seconds and arrive out of order - 8 rows in ticket order,
 every name in its own row, the camera never paused, each slip's picks in Excel well under a second after it lay still; plus the tag
 snapshot, review list, `?` marker, wrong-jornada breaker, classic card, undo while a name is in flight, config migration, and the name
-reader's failure paths.
+reader's failure paths; and the failure cases found in review: several slips queued behind a card, closing the window with names in
+flight, a failing name reader, a locked `log.csv`, config files in other encodings, small screens, keys typed in entries.
 
 **Not tested on real hardware** - there was no Windows PC, webcam, Excel or API key in the build environment: the live **C920s**
 (autofocus hunting, exposure changes after a hand passes, the focus slider), the **Excel COM connection** (verified only against a

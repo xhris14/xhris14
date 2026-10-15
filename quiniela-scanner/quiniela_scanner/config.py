@@ -1,8 +1,12 @@
 """User settings, stored as config.json next to the program."""
 from __future__ import annotations
 
+import codecs
 import json
+import locale
+import math
 import os
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -10,6 +14,35 @@ from pathlib import Path
 CONFIG_VERSION = 2
 # Builds before version 2 saved every setting, so these three would pin the old (slow, hands-on) defaults forever.
 RESET_ON_UPGRADE = ("stable_frames", "auto_enter_delay_s", "auto_enter")
+
+
+# Hand-edited values that would break the app (0 matches, NaN timeouts, a negative camera ...) fall back to the default.
+RANGES = {"matches_per_slip": (1, 30), "camera_index": (0, 20), "frame_width": (160, 8192), "frame_height": (120, 8192),
+          "manual_focus": (0, 255), "stable_frames": (1, 120), "name_workers": (1, 64), "name_timeout_s": (0, 3600),
+          "auto_enter_delay_s": (0, 600), "auto_enter_max_blank": (0, 30), "blank_font_size": (1, 72),
+          "min_ink": (0, 1), "multi_ratio": (0, 1)}
+CHOICES = {"backend": ("auto", "com", "file"), "camera_backend": ("dshow", "msmf", "auto"),
+           "name_tag_position": ("before", "after")}
+
+
+def read_text_any(path: Path) -> str:
+    """Text of a hand-edited file whatever its encoding: UTF-8 (with or without BOM), UTF-16 (what PowerShell's
+    '>' writes) or the Windows ANSI code page. Raises OSError only when the file cannot be read at all."""
+    raw = Path(path).read_bytes()
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw.decode("utf-8-sig", errors="replace")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", errors="replace")
+    if b"\x00" in raw[:64]:                              # UTF-16 without a BOM
+        return raw.decode("utf-16-be" if raw[:1] == b"\x00" else "utf-16-le", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode(locale.getpreferredencoding(False) or "cp1252")
+    except (UnicodeDecodeError, LookupError):
+        return raw.decode("cp1252", errors="replace")
 
 
 def app_dir() -> Path:
@@ -71,6 +104,7 @@ class Config:
 
     def __post_init__(self):
         self.migrated: list = []         # settings of an older config.json that were reset (not saved)
+        self.notes: list = []            # problems with config.json / .env to show the user (not saved)
         self._session: dict = {}         # command-line overrides: name -> the value to keep in config.json
 
     def override(self, **values) -> None:
@@ -91,10 +125,13 @@ class Config:
         if not path.exists():
             return cfg
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return cfg
-        if not isinstance(data, dict):
+            data = json.loads(read_text_any(path))
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as e:       # (UnicodeError is a ValueError)
+            kept = "" if isinstance(e, OSError) else cls._keep_copy(path)
+            cfg.notes.append(f"{path.name} could not be read ({e.__class__.__name__}: {e}) - using the default settings."
+                             + (f" Your file was kept as {kept}." if kept else ""))
             return cfg
         version = data.get("config_version")
         if not isinstance(version, int) or isinstance(version, bool) or version < CONFIG_VERSION:
@@ -110,13 +147,37 @@ class Config:
             elif isinstance(d, int):
                 ok = isinstance(v, int) and not isinstance(v, bool)
             elif isinstance(d, float):
-                ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+                ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
                 v = float(v) if ok else v
+            elif isinstance(d, list):
+                ok = isinstance(v, list) and bool(v) and all(isinstance(x, str) and x.strip() for x in v)
             else:
                 ok = isinstance(v, type(d))
+            if ok and f.name in RANGES:
+                lo, hi = RANGES[f.name]
+                ok = lo <= v <= hi
+            if ok and f.name in CHOICES:
+                ok = v in CHOICES[f.name]
             if ok:
                 setattr(cfg, f.name, v)
+            else:
+                cfg.notes.append(f"{path.name}: {f.name}={v!r} is not valid - using {d!r}.")
         return cfg
+
+    @staticmethod
+    def _keep_copy(path: Path) -> str:
+        """An unparseable config.json is about to be replaced by the defaults on close: keep what the user wrote."""
+        try:
+            if not path.read_bytes().strip():
+                return ""
+            for i in range(1, 50):
+                bak = path.with_name(path.name + (".bak" if i == 1 else f".bak{i}"))
+                if not bak.exists():
+                    shutil.copy2(path, bak)
+                    return bak.name
+        except OSError:
+            pass
+        return ""
 
     def save(self, path: Path | None = None) -> None:
         """Write only what differs from the defaults (so new defaults reach everybody) plus config_version."""
@@ -133,19 +194,24 @@ class Config:
             pass
 
 
-def load_dotenv() -> None:
-    """Read ANTHROPIC_API_KEY=... from a .env file next to the program (if the variable is not already set)."""
+def load_dotenv() -> str:
+    """Read ANTHROPIC_API_KEY=... from a .env file next to the program (if the variable is not already set).
+    Returns "" or a sentence for the user when the file exists but could not be read."""
     env = app_dir() / ".env"
     if not env.exists():
-        return
+        return ""
     try:
-        for line in env.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-    except OSError:
-        pass
+        text = read_text_any(env)
+    except OSError as e:
+        return f".env could not be read ({e.__class__.__name__}) - the API key was not loaded."
+    for line in text.splitlines():
+        line = line.strip().lstrip("\ufeff")
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            k = k.strip().removeprefix("export ").strip()
+            if k and not os.environ.get(k):
+                os.environ[k] = v.strip().strip('"').strip("'")
+    return ""
 
 
 def anthropic_key_present() -> bool:

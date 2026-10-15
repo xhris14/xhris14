@@ -3,13 +3,16 @@
 Stack workflow ("fast mode"): the engine reads a slip, the picks go into Excel at once, and the handwritten
 name is read in the background and filled into the same row a few seconds later. The engine is never paused,
 so the next slip of the stack is picked up as soon as the previous one is lifted. Slips that need a human
-(unclear marks, no name reader, auto-enter off) open the classic card and pause the engine until Enter / Esc.
+(unclear marks, no name reader, auto-enter off) open the classic card; the engine keeps reading meanwhile and
+every slip that arrives while a card is open waits in ``backlog`` (loud: beep + alert) and is entered, in
+arrival order, as soon as the card is closed.
 
 Threading rules: tkinter and Excel (COM) are touched from the Tk thread only. Worker threads (camera, name
 reads, disk writes) hand their results over through ``self.events``.
 """
 from __future__ import annotations
 
+import collections
 import os
 import queue
 import re
@@ -42,7 +45,19 @@ PREVIEW_W = 520             # the live picture is shrunk to this before anything
 PREVIEW_FPS = 15
 TICK_MS = 25
 BREAK_S = 60                # a gap between two entries longer than this is a break, not part of the average
-KEEP_CROPS = 20             # name pictures kept for the most recent entries (review items are always kept)
+KEEP_CROPS = 20             # name pictures kept (as arrays) for the most recent entries
+CLOSE_WAIT_S = 10.0         # closing the window: wait this long for names that are still being read
+CAPTURE_DEBOUNCE_S = 1.5    # 'Capture now' ignores clicks this soon after the last one
+READER_FAILS = 3            # consecutive service failures (key, credit, line, rate limit) = the name reader is down
+READER_HANG_S = 10.0        # READER_FAILS requests silent for this long (or half name_timeout_s) and none answered: down
+
+_JORNADA_RE = re.compile(r"jornada[\s_\-.#:]*(?:n(?:o|º|°|um|úm|ro)?\.?[\s_\-.#:]*)?(\d+)", re.I)
+
+
+def jornada_of(workbook_name: str) -> str:
+    """'JORNADA 10 PC.xlsx', 'Jornada_10', 'JORNADA No. 10', 'JORNADA #10' -> '10'; '' when there is no number."""
+    m = _JORNADA_RE.search(workbook_name or "")
+    return m.group(1) if m else ""
 
 
 def _to_photo(img_bgr: np.ndarray, width: int | None = None, height: int | None = None) -> ImageTk.PhotoImage:
@@ -59,6 +74,15 @@ def _shrink(img: np.ndarray, width: int) -> np.ndarray:
     if w <= width:
         return img
     return cv2.resize(img, None, fx=width / w, fy=width / w, interpolation=cv2.INTER_AREA)
+
+
+def _jpeg(img: np.ndarray) -> bytes | None:
+    """A name picture as JPEG bytes (~10 KB instead of ~190 KB as an array): review items live as long as the session."""
+    try:
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return buf.tobytes() if ok else None
+    except cv2.error:
+        return None
 
 
 @dataclass(frozen=True)
@@ -79,6 +103,7 @@ class Pending:
     id: int
     reading: sv.SlipReading
     touched: bool = False                 # operator edited something -> no auto-enter, keep their name
+    edited: set = field(default_factory=set)   # rows whose pick the operator chose by hand
     hold: bool = False                    # Excel refused it in fast mode: only a human may enter it now
     name_done: bool = False
     name_legible: bool = False
@@ -102,6 +127,7 @@ class Job:
     t_enter: float
     reading: sv.SlipReading | None = field(default=None, repr=False)   # dropped once the job is settled
     name_crop: np.ndarray | None = field(default=None, repr=False)
+    crop_jpg: bytes | None = field(default=None, repr=False)           # name_crop of a review row, as JPEG
     read_ms: float = 0.0
     excel_ms: float = 0.0
     name_ms: float | None = None
@@ -122,6 +148,14 @@ class Job:
     cycle_s: float | None = None          # time since the previous entry
     logged: bool = False
 
+    def crop(self) -> np.ndarray | None:
+        """The name picture, if it is still kept (as an array for recent rows, as JPEG for review rows)."""
+        if self.name_crop is not None:
+            return self.name_crop
+        if self.crop_jpg is not None:
+            return cv2.imdecode(np.frombuffer(self.crop_jpg, np.uint8), cv2.IMREAD_COLOR)
+        return None
+
     @property
     def name_done(self) -> bool:
         return self.state != "reading"
@@ -140,7 +174,13 @@ class App(tk.Tk):
         super().__init__()
         self.cfg = cfg
         self.title("Quiniela Scanner")
-        self.minsize(1180, 780)
+        sw, sh, dpi = self._screen()
+        self.compact = sh / dpi < 900                # small screen (1366x768, 150% DPI on 1080p ...): denser layout
+        self.preview_w = 360 if self.compact else PREVIEW_W
+        self.slip_box = (200, 215) if self.compact else (310, 325)       # max size of the slip picture on the card
+        self.rev_w = 300 if self.compact else 460                       # ... and of the picture in the review panel
+        self.tree_rows = 3 if self.compact else 4
+        self.minsize(min(1100, sw - 20), min(520, sh - self._margin_h(dpi)))
         base = app_dir()
         self.audit = AuditLog(base / "scans")
         self.scanlog = ScanLog(base / "scanner.log")
@@ -157,6 +197,7 @@ class App(tk.Tk):
         self.engine = CaptureEngine(cfg.matches_per_slip, cfg.stable_frames,
                                     sv.Settings(min_ink=cfg.min_ink, multi_ratio=cfg.multi_ratio),
                                     dedupe=not getattr(source, "demo", False))
+        self.engine.paused = False                   # a card never pauses the engine: later slips queue in self.backlog
         self.pending: Pending | None = None
         self.marker = (cfg.blank_marker or "-")      # what an empty box turns into ("F1")
         self._scan_id = 0
@@ -167,17 +208,34 @@ class App(tk.Tk):
         self.jobs: dict[int, Job] = {}
         self._job_id = 0
         self.entry_times: list[float] = []
-        self.backlog: list = []                      # readings that arrived while a card was open (never dropped)
+        self.backlog: list = []                      # (Update, t_event, TagSnap) that arrived while a card was open
+        self._draining = False
         self.card_job: Job | None = None             # the entered slip the card is showing (read-only)
         self.rev_job: Job | None = None              # the history row selected for review
         self.infos: list = []
         self.sel_key: str | None = None
         self.ticket_custom = False        # operator typed a ticket number
+        self._ticket_prog = False         # ticket_var is being set by the program, not typed
         self.breaker = ""                 # message while auto-enter is switched off by the circuit breaker
-        self._alert_kind = ""
+        self._alerts: dict = {}           # kind -> message of every alert that is up (insertion ordered)
         self._entered_msg = ""
-        self.callback_errors: list = []
+        self._dup_latched = False         # the engine dropped a repeat read: keep its 'lift it off' message up
+        self.dupes_skipped = 0
+        self.callback_errors = collections.deque(maxlen=50)      # short strings, never exception objects
+        self.callback_error_count = 0
+        self._seen_errors: set = set()
         self.closing = False
+        self._close_started = False
+        self._capturing = False
+        self._capture_not_before = 0.0
+        self._busy = 0                    # name workers running a request right now (any kind)
+        self._busy_lock = threading.Lock()
+        self._rd_fail = 0                 # consecutive service failures of the name reader
+        self._rd_down = False
+        self._reader_breaker = ""
+        self._last_name_done = time.perf_counter()     # when any name request last finished (pool progress)
+        self._last_name_ok = self._last_name_done
+        self._queue_warn = False
         self.reader, self.reader_note = make_reader(cfg.read_names_with_claude, cfg.claude_model, cfg.claude_effort)
         self.pool = ThreadPoolExecutor(max_workers=max(1, int(cfg.name_workers)), thread_name_prefix="name")
         self.io = ThreadPoolExecutor(max_workers=1, thread_name_prefix="io")   # audit images + scanner.log
@@ -191,9 +249,13 @@ class App(tk.Tk):
         self._last_cb_err = ("", 0.0)
 
         self._build()
-        self.bind_all("<Return>", lambda e: self.commit())
-        self.bind_all("<Escape>", lambda e: self.escape())
+        self.bind_all("<Return>", self._on_return)
+        self.bind_all("<Escape>", self._on_escape)
         self.bind_all("<F2>", lambda e: self.tag_on.set(not self.tag_on.get()))
+        self.bind("<Configure>", self._on_resize)
+        self.bind_all("<MouseWheel>", self._on_wheel)
+        self.bind_all("<Button-4>", self._on_wheel)
+        self.bind_all("<Button-5>", self._on_wheel)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.log("START", fast=cfg.auto_enter_delay_s <= 0, workers=cfg.name_workers, stable=cfg.stable_frames,
                  reader=type(self.reader).__name__ if self.reader else "none",
@@ -201,16 +263,31 @@ class App(tk.Tk):
         if getattr(cfg, "migrated", None):
             self.hint_var.set("Settings from an older version were reset to the new defaults: " +
                               ", ".join(cfg.migrated) + ".")
-        self.update_idletasks()                      # size to what the widgets need (high-DPI fonts grow), within the screen
-        self.geometry(f"{min(max(1240, self.winfo_reqwidth()), self.winfo_screenwidth() - 20)}x"
-                      f"{min(max(840, self.winfo_reqheight() + 70), self.winfo_screenheight() - 60)}")   # +70: room for the alert strip
+        if getattr(cfg, "notes", None):              # config.json / .env problems found while starting
+            self.alert("  ".join(cfg.notes), "config", beep=False)
         self.connect_excel()
+        self.update_idletasks()                      # size to what the widgets need (high-DPI fonts grow), within the screen
+        self._sync_mid()
+        self.update_idletasks()
+        room = 0 if self.compact else 140            # room for the alert strip (on a small screen the middle scrolls instead)
+        self.geometry(f"{min(max(1240, self.winfo_reqwidth()), sw - 20)}x"
+                      f"{min(max(840 if not self.compact else 0, self.winfo_reqheight() + room), sh - self._margin_h(dpi))}")
         self.start_camera()
         self._tick_id = self.after(TICK_MS, self.tick)
 
     # ------------------------------------------------------------------ UI
+    def _screen(self) -> tuple:
+        """(width, height, scale) of the screen; scale = size of a pixel relative to 96 dpi (Windows display scaling)."""
+        return (self.winfo_screenwidth(), self.winfo_screenheight(),
+                max(0.5, float(self.tk.call("tk", "scaling")) / (96 / 72)))
+
+    @staticmethod
+    def _margin_h(dpi: float) -> int:
+        """Height of the screen that is not ours: title bar + taskbar (+ a little air)."""
+        return int(90 * dpi)
+
     def _build(self):
-        pad = dict(padx=6, pady=3)
+        pad = dict(padx=6, pady=3) if not self.compact else dict(padx=6, pady=1)
         style = ttk.Style(self)
         style.configure("Big.TButton", font=(FONT, 12, "bold"), padding=8)
         style.configure("Card.TLabelframe.Label", font=(FONT, 11, "bold"))
@@ -242,8 +319,10 @@ class App(tk.Tk):
         # ----- loud message strip (Excel trouble, circuit breaker); only shown while there is something to say
         self.alert_var = tk.StringVar()
         self.alert_frame = tk.Frame(self, bg=BAD)
-        tk.Label(self.alert_frame, textvariable=self.alert_var, bg=BAD, fg="white", font=(FONT, 13, "bold"),
-                 wraplength=1050, justify="left").pack(side="left", padx=10, pady=6)
+        self.alert_lbl = tk.Label(self.alert_frame, textvariable=self.alert_var, bg=BAD, fg="white", justify="left",
+                                  font=(FONT, 11 if self.compact else 13, "bold"),
+                                  wraplength=max(500, min(1050, self.winfo_screenwidth() - 220)))
+        self.alert_lbl.pack(side="left", padx=10, pady=4)
         tk.Button(self.alert_frame, text="Dismiss", command=self.clear_alert).pack(side="right", padx=10)
 
         # ----- target row
@@ -257,9 +336,9 @@ class App(tk.Tk):
         self.block_cb.bind("<<ComboboxSelected>>", lambda e: self.on_block_change())
         ttk.Label(tgt, text="Ticket #:").grid(row=0, column=2, **pad)
         self.ticket_var = tk.StringVar()
-        ticket_entry = ttk.Entry(tgt, textvariable=self.ticket_var, width=7, font=(FONT, 12, "bold"))
+        self.ticket_entry = ticket_entry = ttk.Entry(tgt, textvariable=self.ticket_var, width=7, font=(FONT, 12, "bold"))
         ticket_entry.grid(row=0, column=3, **pad)
-        ticket_entry.bind("<Key>", self.on_ticket_key)
+        self.ticket_var.trace_add("write", lambda *a: self.on_ticket_edit())
         self.auto_var = tk.BooleanVar(value=self.cfg.auto_enter)
         ttk.Checkbutton(tgt, text="Auto-enter clean scans", variable=self.auto_var).grid(row=0, column=4, padx=14)
         self.auto_var.trace_add("write", lambda *a: self.on_auto_change())
@@ -272,7 +351,8 @@ class App(tk.Tk):
         self.tag_pos = tk.StringVar(value=self.cfg.name_tag_position if self.cfg.name_tag_position in
                                     ("before", "after") else "after")
         self.tag_on = tk.BooleanVar(value=False)          # always starts OFF so nobody is tagged by accident
-        ttk.Entry(tagrow, textvariable=self.tag_var, width=8, font=(FONT, 12, "bold")).pack(side="left", padx=(0, 8))
+        self.tag_entry = ttk.Entry(tagrow, textvariable=self.tag_var, width=8, font=(FONT, 12, "bold"))
+        self.tag_entry.pack(side="left", padx=(0, 8))
         ttk.Radiobutton(tagrow, text="Before name", value="before", variable=self.tag_pos).pack(side="left", padx=2)
         ttk.Radiobutton(tagrow, text="After name", value="after", variable=self.tag_pos).pack(side="left", padx=2)
         ttk.Checkbutton(tagrow, text="Add tag  (F2)", variable=self.tag_on).pack(side="left", padx=14)
@@ -281,36 +361,54 @@ class App(tk.Tk):
         self.tag_state_lbl.pack(side="left", padx=6)
         for v in (self.tag_var, self.tag_pos, self.tag_on):
             v.trace_add("write", lambda *a: self.on_tag_change())
+        self.jornada_var = tk.StringVar()                  # whether the wrong-jornada guard is on (see expected_jornada)
+        self.jornada_lbl = ttk.Label(tagrow, textvariable=self.jornada_var, font=(FONT, 10, "bold"))
+        self.jornada_lbl.pack(side="left", padx=10)
 
-        # ----- main: preview | card
-        main = ttk.Frame(self)
-        main.pack(fill="both", expand=True, **pad)
+        # ----- main: preview | card. On a screen that is too small for it the middle scrolls; the strip and the
+        # history below it are packed first (side="bottom") so they always keep their room.
+        self._mid = ttk.Frame(self)
+        self._mid_canvas = tk.Canvas(self._mid, highlightthickness=0, borderwidth=0, takefocus=0,
+                                     background=style.lookup("TFrame", "background") or self.cget("background"))
+        self._mid_sb = ttk.Scrollbar(self._mid, orient="vertical", command=self._mid_canvas.yview)
+        self._mid_canvas.configure(yscrollcommand=self._mid_sb.set)
+        self._mid_canvas.pack(side="left", fill="both", expand=True)
+        main = ttk.Frame(self._mid_canvas)
+        self._mid_win = self._mid_canvas.create_window(0, 0, window=main, anchor="nw")
+        self._main = main
+        main.bind("<Configure>", lambda e: self._sync_mid())
+        self._mid_canvas.bind("<Configure>", lambda e: self._sync_mid())
         left = ttk.Frame(main)
         left.pack(side="left", fill="y", padx=4)
         self.preview = ttk.Label(left)
         self.preview.pack()
+        self._prev_photo = ImageTk.PhotoImage(Image.new("RGB", (self.preview_w, round(self.preview_w * 9 / 16)), (236, 236, 236)))
+        self.preview.configure(image=self._prev_photo)      # (a placeholder: the window is sized for the real picture)
         self.status_var = tk.StringVar(value="Starting camera...")
-        ttk.Label(left, textvariable=self.status_var, font=(FONT, 13, "bold"), wraplength=520).pack(anchor="w", pady=4)
+        ttk.Label(left, textvariable=self.status_var, font=(FONT, 13, "bold"), wraplength=self.preview_w).pack(
+            anchor="w", pady=2 if self.compact else 4)
         prog = ttk.Frame(left)
-        prog.pack(anchor="w", fill="x", pady=(0, 4))
-        self.progress = ttk.Progressbar(prog, maximum=1.0, length=400)
+        prog.pack(anchor="w", fill="x", pady=(0, 2 if self.compact else 4))
+        self.progress = ttk.Progressbar(prog, maximum=1.0, length=self.preview_w - 120)
         self.progress.pack(side="left", fill="x", expand=True)
         ttk.Button(prog, text="Capture now", command=self.capture_now).pack(side="left", padx=(8, 0))
         self.last_var = tk.StringVar()
-        ttk.Label(left, textvariable=self.last_var, font=(FONT, 11), foreground=GOOD, wraplength=520).pack(anchor="w")
+        ttk.Label(left, textvariable=self.last_var, font=(FONT, 11), foreground=GOOD,
+                  wraplength=self.preview_w).pack(anchor="w")
         self.hint_var = tk.StringVar(value=self.reader_note)
-        ttk.Label(left, textvariable=self.hint_var, foreground="#555", wraplength=520).pack(anchor="w")
+        ttk.Label(left, textvariable=self.hint_var, foreground="#555", wraplength=self.preview_w).pack(anchor="w")
         rev = ttk.LabelFrame(left, text="Selected entry  (click a row of the list below)")
-        rev.pack(anchor="w", fill="x", pady=(10, 0))
+        rev.pack(anchor="w", fill="x", pady=(4 if self.compact else 10, 0))
         self.rev_img = ttk.Label(rev)
         self.rev_img.grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.rev_info = tk.StringVar()
-        ttk.Label(rev, textvariable=self.rev_info, wraplength=500, foreground=BAD).grid(
+        ttk.Label(rev, textvariable=self.rev_info, wraplength=self.preview_w - 20, foreground=BAD).grid(
             row=1, column=0, columnspan=3, sticky="w", padx=4)
         self.rev_name = tk.StringVar()
-        self.rev_entry = ttk.Entry(rev, textvariable=self.rev_name, font=(FONT, 13, "bold"), width=20)
+        self.rev_entry = ttk.Entry(rev, textvariable=self.rev_name, font=(FONT, 13, "bold"), width=16 if self.compact else 20)
         self.rev_entry.grid(row=2, column=0, padx=4, pady=3)
         self.rev_entry.bind("<Return>", lambda e: (self.save_review_name(), "break")[1])
+        self.rev_entry.bind("<Escape>", lambda e: (self.focus_set(), "break")[1])    # Esc leaves the entry, never the card
         self.rev_save = ttk.Button(rev, text="Save name", command=self.save_review_name)
         self.rev_save.grid(row=2, column=1, padx=2)
         self.rev_undo = ttk.Button(rev, text="Undo this entry", command=self.undo_selected)
@@ -373,14 +471,16 @@ class App(tk.Tk):
 
         # ----- stats strip
         self.stats_var = tk.StringVar()
-        self.stats_lbl = ttk.Label(self, textvariable=self.stats_var, font=(FONT, 11, "bold"))
-        self.stats_lbl.pack(fill="x", padx=10, pady=(2, 0))
+        self.stats_lbl = ttk.Label(self, textvariable=self.stats_var, font=(FONT, 11, "bold"),
+                                   wraplength=max(500, self.winfo_screenwidth() - 60))
 
         # ----- history (red rows = needs a look) + the review panel for the selected row
         hist = ttk.LabelFrame(self, text="Entered this session  (red = check the name)")
-        hist.pack(fill="x", **pad)
+        hist.pack(side="bottom", fill="x", **pad)             # (packed first: the strip goes above it, the middle gets the rest)
+        self.stats_lbl.pack(side="bottom", fill="x", padx=10, pady=(2, 0))
+        self._mid.pack(fill="both", expand=True, **pad)
         cols = ("time", "ticket", "name", "picks", "status")
-        self.tree = ttk.Treeview(hist, columns=cols, show="headings", height=4)
+        self.tree = ttk.Treeview(hist, columns=cols, show="headings", height=self.tree_rows)
         for c, w in zip(cols, (80, 60, 210, 210, 400)):
             self.tree.heading(c, text=c.title())
             self.tree.column(c, width=w, anchor="w")
@@ -395,12 +495,79 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.on_tree_select())
         side = ttk.Frame(hist)
         side.pack(side="left", padx=8, fill="y")
-        ttk.Button(side, text="Undo last", command=self.undo).pack(anchor="w", pady=2)
-        ttk.Button(side, text="Next to review", command=self.select_next_review).pack(anchor="w", pady=2)
+        self.undo_btn = ttk.Button(side, text="Undo last", command=self.undo)
+        self.undo_btn.pack(anchor="w", pady=2)
+        self.review_btn = ttk.Button(side, text="Next to review", command=self.select_next_review)
+        self.review_btn.pack(anchor="w", pady=2)
         self.clear_card()
         self.on_tag_change()
         self.on_tree_select()
         self.update_stats()
+
+    def _on_resize(self, e):
+        """The long strips wrap at the width of the window (not of the screen), so nothing runs off its right edge."""
+        if e.widget is self and e.width > 300:
+            self.stats_lbl.configure(wraplength=e.width - 40)
+            self.alert_lbl.configure(wraplength=max(400, min(1050, e.width - 200)))
+
+    def _sync_mid(self):
+        """Keep the scrolling middle in step: as tall as its content wants, a scrollbar only when it is squeezed."""
+        c, main = self._mid_canvas, self._main
+        rw, rh = main.winfo_reqwidth(), main.winfo_reqheight()
+        c.configure(width=rw, height=rh, scrollregion=(0, 0, max(rw, c.winfo_width()), rh))
+        c.itemconfigure(self._mid_win, width=max(rw, c.winfo_width()))
+        need = c.winfo_height() > 1 and rh > c.winfo_height() + 1
+        if need and not self._mid_sb.winfo_ismapped():
+            self._mid_sb.pack(side="right", fill="y")
+        elif not need and self._mid_sb.winfo_ismapped():
+            self._mid_sb.pack_forget()
+            c.yview_moveto(0)
+
+    def scroll_mid(self, bottom: bool):
+        """On a small screen the middle scrolls: show its bottom (the review panel) or its top (the card, the banner)."""
+        if self._mid_sb.winfo_ismapped():
+            self.update_idletasks()                       # (the content may just have grown: take its new size first)
+            self._sync_mid()
+            self._mid_canvas.yview_moveto(1.0 if bottom else 0.0)
+
+    def _on_wheel(self, e):
+        if not self._mid_sb.winfo_ismapped():
+            return
+        w = self.winfo_containing(e.x_root, e.y_root)
+        if w is None or not str(w).startswith(str(self._mid_canvas)):
+            return
+        up = e.num == 4 or getattr(e, "delta", 0) > 0
+        self._mid_canvas.yview_scroll(-2 if up else 2, "units")
+
+    def _key_context(self, e) -> str:
+        """Where did Enter / Esc come from? 'card' = the window itself or a widget with no use for the key (it may act
+        on the card); 'entry' = an entry / drop-down / spinbox of this window, which keeps the key for itself;
+        'other' = another window (a dialog, the drop-down list of a combobox)."""
+        w = e.widget
+        try:
+            if w.winfo_toplevel() is not self:
+                return "other"
+            if any(str(w) == str(o) for o in (self.ticket_entry, self.tag_entry, self.rev_entry, self.block_cb)):
+                return "entry"
+            return "entry" if w.winfo_class() in ("TSpinbox", "Spinbox", "Scale") else "card"
+        except (AttributeError, tk.TclError):
+            return "other"
+
+    def _on_return(self, e):
+        ctx = self._key_context(e)
+        if ctx == "card":
+            self.commit()
+        elif ctx == "entry":
+            self.focus_set()                      # Enter confirms what was typed; the next Enter writes the card
+            return "break"
+
+    def _on_escape(self, e):
+        ctx = self._key_context(e)
+        if ctx == "card":
+            self.escape()
+        elif ctx == "entry":
+            self.focus_set()                      # Esc leaves the entry; it never discards the card
+            return "break"
 
     # ----------------------------------------------------------- camera
     def start_camera(self):
@@ -483,7 +650,6 @@ class App(tk.Tk):
             if frame is None:
                 continue
             last = fid
-            self.engine.paused = self.pending is not None
             try:
                 upd = self.engine.feed(frame)
             except Exception as e:            # never let a vision bug kill the camera thread
@@ -493,14 +659,22 @@ class App(tk.Tk):
                     self.log("VISION_ERROR", err=str(e))
             with self._lock:
                 self._latest = (fid, frame, upd)
-            if upd.reading is not None or upd.error:
+            if upd.reading is not None or upd.error or upd.duplicate:
                 self.events.put(("scan", upd, time.perf_counter()))
 
     def capture_now(self):
         with self._lock:
             latest = self._latest
-        if latest is None or self.pending is not None:
+        if latest is None:
             return
+        if self.pending is not None:
+            self.status_var.set("Finish the slip on the card first (Enter = write, Esc = discard).")
+            return
+        now = time.monotonic()
+        if self._capturing or now < self._capture_not_before:      # a double click must not enter the slip twice
+            return
+        self._capturing = True
+        self._capture_not_before = now + CAPTURE_DEBOUNCE_S
         frame = latest[1]
 
         def run():                            # a slip read takes ~200 ms: keep it off the Tk thread
@@ -508,27 +682,46 @@ class App(tk.Tk):
                 upd = self.engine.capture_now(frame)
             except Exception as e:
                 upd = Update("idle", f"capture failed: {e}", error=str(e))
+            finally:
+                self._capturing = False
             self.events.put(("scan", upd, time.perf_counter()))
         threading.Thread(target=run, name="capture-now", daemon=True).start()
 
     # ------------------------------------------------------------ Excel
     def connect_excel(self):
+        """(Re)connect to the workbook. Whatever goes wrong - not just ExcelError - ends up in the red Excel strip:
+        the window must always open."""
         try:
             self.backend = self._fixed_backend or open_backend(self.cfg.backend, self.cfg.workbook, self.cfg.workbook_path)
             self.sink = ExcelSink(self.backend, self.cfg.sheets, self.cfg.name_header,
                                   self.cfg.uppercase_names, self.cfg.save_after_write,
                                   self.cfg.blank_marker, self.cfg.blank_font_size)
-        except ExcelError as e:
+            self.refresh_blocks(select_default=True)
+        except Exception as e:
+            msg = str(e) if isinstance(e, ExcelError) else f"{e.__class__.__name__}: {e}"
             self.sink = None
-            self.excel_var.set(f"Excel: NOT CONNECTED - {e}")
+            self.excel_var.set(f"Excel: NOT CONNECTED - {msg}")
             self.excel_lbl.configure(foreground=BAD)
             self.block_cb["values"] = []
-            self.log("EXCEL_NOT_CONNECTED", err=str(e))
+            self.update_jornada_note()
+            self.log("EXCEL_NOT_CONNECTED", err=msg)
             return
         self.excel_var.set(f"Excel: {self.backend.label}")
         self.excel_lbl.configure(foreground=GOOD)
-        self.log("EXCEL", workbook=getattr(self.backend, "workbook_name", ""), blocks=len(self.sink.blocks))
-        self.refresh_blocks(select_default=True)
+        self.update_jornada_note()
+        self.log("EXCEL", workbook=getattr(self.backend, "workbook_name", ""), blocks=len(self.sink.blocks),
+                 jornada=self.expected_jornada() or "off")
+
+    def update_jornada_note(self):
+        exp = self.expected_jornada() if self.sink is not None else ""
+        if exp:
+            self.jornada_var.set(f"Jornada check: {exp}")
+            self.jornada_lbl.configure(foreground=GOOD)
+        elif self.sink is not None:
+            self.jornada_var.set("Jornada check OFF - no 'jornada <n>' in the workbook name")
+            self.jornada_lbl.configure(foreground=WARN)
+        else:
+            self.jornada_var.set("")
 
     def refresh_blocks(self, select_default=False):
         if self.sink is None:
@@ -541,16 +734,25 @@ class App(tk.Tk):
         if chosen:
             self.select_info(chosen)
 
-    def on_ticket_key(self, e):
-        if e.keysym not in ("Return", "Escape", "Tab"):
+    def on_ticket_edit(self):
+        """Only a real edit of the Ticket box (typing, paste, cut) makes the ticket the operator's own choice."""
+        if not self._ticket_prog:
             self.ticket_custom = True
+
+    def set_ticket_text(self, text: str):
+        self._ticket_prog = True
+        try:
+            self.ticket_var.set(text)
+        finally:
+            self._ticket_prog = False
 
     def select_info(self, info):
         self.ticket_custom = False
         self.sel_key = info.block.key
         self.block_var.set(info.label)
         slot = info.first_free
-        self.ticket_var.set(str(slot.ticket) if slot and slot.ticket is not None else "")
+        self.set_ticket_text(str(slot.ticket) if slot and slot.ticket is not None else "")
+        self.ticket_custom = False
 
     def selected_info(self):
         return next((i for i in self.infos if i.block.key == self.sel_key), None)
@@ -563,8 +765,7 @@ class App(tk.Tk):
     def expected_jornada(self) -> str:
         if self.cfg.expected_jornada:
             return self.cfg.expected_jornada
-        m = re.search(r"jornada\s*(\d+)", getattr(self.backend, "workbook_name", ""), re.I)
-        return m.group(1) if m else ""
+        return jornada_of(getattr(self.backend, "workbook_name", ""))
 
     def target_slot(self):
         if self.sink is None:
@@ -601,30 +802,42 @@ class App(tk.Tk):
             (sound.attention if attention else sound.ok)()
 
     def alert(self, msg: str, kind: str = "excel", beep: bool = True):
-        self.alert_var.set(msg)
-        self._alert_kind = kind
-        if not self.alert_frame.winfo_ismapped():
-            self.alert_frame.pack(fill="x", padx=6, pady=3, before=self._tgt)
-        self.log("ALERT", kind=kind, msg=msg)
+        """Red strip under the toolbar. One message per ``kind`` (a new one of the same kind replaces it); the strip
+        shows every kind that is up, so a backlog or reader alert never hides an Excel one."""
+        changed = self._alerts.get(kind) != msg
+        self._alerts[kind] = msg
+        self._show_alerts()
+        if changed or kind == "excel":                    # (every refused slip is an event worth a line; repeats of the others are not)
+            self.log("ALERT", kind=kind, msg=msg)
         if beep:
             self.beep(True)
 
+    def _show_alerts(self):
+        self.alert_var.set("\n".join(self._alerts.values()))
+        if self._alerts and not self.alert_frame.winfo_ismapped():
+            self.alert_frame.pack(fill="x", padx=6, pady=3, before=self._tgt)
+        elif not self._alerts:
+            self.alert_frame.pack_forget()
+
     def clear_alert(self, kind: str | None = None):
-        if kind is not None and kind != self._alert_kind:
+        """One kind, or (the Dismiss button) all of them."""
+        if kind is None:
+            self._alerts.clear()
+        elif self._alerts.pop(kind, None) is None:
             return
-        self._alert_kind = ""
-        self.alert_var.set("")
-        self.alert_frame.pack_forget()
+        self._show_alerts()
 
     def set_banner(self, text: str, colour: str | None = None):
         self.banner_var.set(text)
         self.banner.configure(bg=colour or self._banner_look[0], fg="white" if colour else self._banner_look[1])
 
     def report_callback_exception(self, exc, val, tb):
-        """An exception inside a Tk callback must not go unnoticed (or stop the tick loop)."""
+        """An exception inside a Tk callback must not go unnoticed (or stop the tick loop). Only a short text is kept:
+        an exception object would pin its traceback, and with it every frame (6 MB each) of the failing call."""
         import traceback
-        self.callback_errors.append(val)
         key, now = f"{exc.__name__}: {val}", time.monotonic()
+        self.callback_errors.append(key[:200])
+        self.callback_error_count += 1
         if key == self._last_cb_err[0] and now - self._last_cb_err[1] < 5:
             return                                        # the same error again and again (a 25 ms loop): say it once
         self._last_cb_err = (key, now)
@@ -634,6 +847,13 @@ class App(tk.Tk):
             traceback.print_exception(exc, val, tb)
         except Exception:
             pass
+        if key not in self._seen_errors and len(self._seen_errors) < 20:     # first time: the operator should know
+            self._seen_errors.add(key)
+            try:
+                self.alert(f"INTERNAL ERROR - {key[:160]}. The app keeps running; if it happens again, send scanner.log.",
+                           "internal", beep=False)
+            except Exception:
+                pass
 
     # --------------------------------------------------------- scans
     def set_card_enabled(self, on: bool):
@@ -661,49 +881,102 @@ class App(tk.Tk):
             lbl.configure(foreground="black")
         blank = np.full((300, 330, 3), 245, np.uint8)
         cv2.putText(blank, "Waiting for a slip...", (40, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 150, 150), 2)
+        blank = _shrink(blank, self.slip_box[0])
         self._photos["slip"] = _to_photo(blank)
         self.slip_img.configure(image=self._photos["slip"])
         self.name_img.configure(image="")
 
     def show_reading(self, rd: sv.SlipReading):
-        """Straightened slip, name picture and pick buttons for a freshly read slip."""
-        self._photos["slip"] = _to_photo(sv.draw_reading(rd), width=310, height=325)
-        self.slip_img.configure(image=self._photos["slip"])
-        self._photos["name"] = _to_photo(rd.name_crop, width=310)
-        self.name_img.configure(image=self._photos["name"])
+        """Pick buttons, straightened slip and name picture for a freshly read slip. The picks (the data) come first:
+        a drawing problem must not leave a card with the wrong marks on it."""
         for i, (v, (lbl, note)) in enumerate(zip(self.pick_vars, self.pick_lbls)):
             v.set(rd.picks[i])
             verdict = rd.verdicts[i]
             lbl.configure(foreground="black" if verdict == sv.OK else WARN if verdict == sv.BLANK else BAD)
             note.configure(text=f"empty = {self.marker}" if verdict == sv.BLANK else VERDICT_TEXT.get(verdict, ""))
+        try:
+            self._photos["slip"] = _to_photo(sv.draw_reading(rd), width=self.slip_box[0], height=self.slip_box[1])
+            self.slip_img.configure(image=self._photos["slip"])
+            self._photos["name"] = _to_photo(rd.name_crop, width=self.slip_box[0])
+            self.name_img.configure(image=self._photos["name"])
+        except Exception as e:
+            self.log("UI_ERROR", where="show_reading", err=repr(e))
 
     def on_scan(self, upd: Update, t_event: float | None = None):
         if upd.reading is None:
+            if upd.duplicate:
+                self.on_duplicate(upd)
+                return
             self.status_var.set(upd.message)
             if upd.error:                                   # the operator has to re-place the slip
                 self.log("UNREADABLE", err=upd.error)
                 self.beep(True)
             return
-        if self.pending is not None:                        # e.g. Excel was busy for seconds and two scans queued up
-            self.backlog.append((upd, t_event))
-            self.update_stats()
+        if self.pending is not None or self.backlog:        # a card is open (or older slips still wait): keep the order
+            self.backlog.append((upd, t_event, self.tag_snapshot()))
+            self.backlog_changed(grew=True)
+            self.drain_backlog()                            # (does nothing while the card is open)
             return
+        self._safe_handle(upd, t_event, None)
+
+    def _safe_handle(self, upd: Update, t_event, snap):
+        n0 = len(self.entries)
+        try:
+            self._handle_scan(upd, t_event, snap)
+        except Exception as e:                              # the next slip must still be handled
+            self.report_callback_exception(type(e), e, e.__traceback__)
+            if len(self.entries) == n0 and self.pending is None:         # neither entered nor on a card
+                self.alert("A slip could not be processed (internal error). Check the last ticket in Excel, then lift "
+                           "the slip and put it back (or press Capture now).", "scanfail")
+
+    def _handle_scan(self, upd: Update, t_event, snap=None):
         t0 = time.perf_counter()
         lag = (t0 - t_event) * 1000 if t_event else 0.0
         if self.fast_ok(upd.reading):
-            if self.enter_fast(upd, t0, lag):
+            if self.enter_fast(upd, t0, lag, snap):
                 return
             self.open_card(upd, hold=True)                   # Excel said no: the operator takes this slip
             self.set_banner("NOT ENTERED - fix Excel, then press Enter", BAD)
             return
         self.open_card(upd)
 
+    def drain_backlog(self):
+        """Enter every slip that waited behind a card, in arrival order, until one needs a card again."""
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while self.backlog and self.pending is None:
+                upd, t_event, snap = self.backlog.pop(0)
+                self._safe_handle(upd, t_event, snap)
+        finally:
+            self._draining = False
+        self.backlog_changed()
+
     def next_backlog(self):
-        """A card was closed: take the slip that was waiting behind it, if any."""
-        if self.backlog and self.pending is None:
-            upd, t_event = self.backlog.pop(0)
-            self.on_scan(upd, t_event)
-            self.update_stats()
+        """A card was closed: take the slips that were waiting behind it."""
+        self.drain_backlog()
+
+    def backlog_changed(self, grew: bool = False):
+        """Slips waiting behind a card are tickets that are not in Excel yet: say so loudly, and beep when the first one
+        queues up."""
+        n = len(self.backlog)
+        if n:
+            self.alert(f"{n} slip{' is' if n == 1 else 's are'} WAITING behind the card - Enter (write) or Esc (discard), "
+                       f"then {'it is' if n == 1 else 'they are'} entered in order.", "backlog", beep=grew and n == 1)
+        else:
+            self.clear_alert("backlog")
+        self.update_stats()
+
+    def on_duplicate(self, upd: Update):
+        """The engine dropped a re-read of the slip that was entered last: count it, log it, keep the message up."""
+        self.dupes_skipped += 1
+        self._dup_latched = True
+        last = next((j.ticket for j in reversed(self.entries) if j.state != "undone"), None)
+        self.log("DUPLICATE_SKIPPED", n=self.dupes_skipped, last_ticket=last)
+        if self.pending is None:
+            self.status_var.set(upd.message)
+        self.update_stats()
 
     def fast_ok(self, rd: sv.SlipReading) -> bool:
         """Can this slip go straight into Excel with its name to follow?"""
@@ -713,10 +986,10 @@ class App(tk.Tk):
     def tag_snapshot(self) -> TagSnap:
         return TagSnap(self.active_tag(), self.tag_pos.get(), self.cfg.tag_separator, self.cfg.uppercase_names)
 
-    def enter_fast(self, upd: Update, t0: float, lag_ms: float) -> bool:
+    def enter_fast(self, upd: Update, t0: float, lag_ms: float, snap: TagSnap | None = None) -> bool:
         """Picks into Excel now, name later. False = Excel refused (the alert is up; the caller opens the card)."""
         rd = upd.reading
-        snap, exp = self.tag_snapshot(), self.expected_jornada()      # taken NOW: F2 may change before the name is back
+        snap, exp = snap or self.tag_snapshot(), self.expected_jornada()   # taken NOW: F2 may change before the name is back
         block, ticket = self.target()
         t1 = time.perf_counter()
         try:
@@ -728,17 +1001,22 @@ class App(tk.Tk):
         self.beep(False)                                               # after the write, so a beep means "it is in"
         shown = [p or self.marker for p in rd.picks]
         job = self.new_job(receipt, rd, shown, snap, exp, upd, excel_ms, t0)
-        self.show_entered(job)
-        self.clear_alert("excel")
-        self.refresh_blocks()
-        job.t_submit = time.perf_counter()
+        # The row is in Excel: ask for its name before any drawing, so that a UI error cannot leave a row without a request.
         try:
             job.future = self.pool.submit(self._name_worker, self.reader, "job", job.id, rd.name_crop, rd.title_crop)
         except RuntimeError:                                           # pool already shut down (closing)
             job.future = None
-        self._entered_msg = f"Entered ticket {receipt.ticket}. Lift the slip - the next one is read automatically."
-        self.last_var.set(f"Last entered: ticket {receipt.ticket}   {' '.join(shown)}   (name follows)")
-        self.update_stats()
+        job.t_submit = time.perf_counter()
+        try:
+            self.show_entered(job)
+            self.clear_alert("excel")
+            self.refresh_blocks()
+            self._entered_msg = f"Entered ticket {receipt.ticket}. Lift the slip - the next one is read automatically."
+            self._dup_latched = False
+            self.last_var.set(f"Last entered: ticket {receipt.ticket}   {' '.join(shown)}   (name follows)")
+            self.update_stats()
+        except Exception as e:                                         # the row is in Excel: never fall back to the card
+            self.log("UI_ERROR", where="enter_fast", ticket=receipt.ticket, err=repr(e))
         job.ui_ms = (time.perf_counter() - t0) * 1000
         job.lag_ms = lag_ms
         return True
@@ -746,10 +1024,11 @@ class App(tk.Tk):
     def new_job(self, receipt: Receipt, rd: sv.SlipReading, shown: list, snap: TagSnap, exp: str, upd: Update,
                 excel_ms: float, t0: float, manual: bool = False) -> Job:
         self._job_id += 1
+        now = time.perf_counter()
         job = Job(self._job_id, str(self._job_id), self.sink, receipt, shown, snap, exp,
-                  getattr(self.backend, "workbook_name", ""), t0, time.perf_counter(), reading=rd,
+                  getattr(self.backend, "workbook_name", ""), t0, now, reading=rd,
                   name_crop=_shrink(rd.name_crop, 640), read_ms=upd.timings.get("read_ms", 0.0),
-                  excel_ms=excel_ms, manual=manual)
+                  excel_ms=excel_ms, manual=manual, t_submit=now)      # (t_submit: check_jobs times a job from here)
         job.feed_ms = upd.timings.get("feed_ms", 0.0)
         job.fp_ms = upd.timings.get("fingerprint_ms", 0.0)
         job.cycle_s = (job.t_enter - self.entry_times[-1]) if self.entry_times else None
@@ -757,13 +1036,16 @@ class App(tk.Tk):
         self.jobs[job.id] = job
         self.iid_jobs[job.iid] = job
         self.entry_times.append(job.t_enter)
-        if len(self.entries) > KEEP_CROPS:                  # only recent entries (and review items) keep their picture
-            old = self.entries[-KEEP_CROPS - 1]
-            if not old.review:
+        if len(self.entries) > KEEP_CROPS:                  # only recent entries, rows still being read and review rows
+            old = self.entries[-KEEP_CROPS - 1]             # keep their picture (review rows as JPEG, see settle)
+            if old.state != "reading" and not old.review:
                 old.name_crop = None
         t = receipt.ticket if receipt.ticket is not None else f"row {receipt.row}"
-        self.tree.insert("", 0, iid=job.iid, values=(time.strftime("%H:%M:%S"), t, "(reading...)", " ".join(shown),
-                                                     job.text), tags=("reading",))
+        try:
+            self.tree.insert("", 0, iid=job.iid, values=(time.strftime("%H:%M:%S"), t, "(reading...)", " ".join(shown),
+                                                         job.text), tags=("reading",))
+        except tk.TclError as e:                            # the job exists and is tracked even without its list row
+            self.log("UI_ERROR", where="new_job", err=repr(e))
         return job
 
     def show_entered(self, job: Job):
@@ -789,6 +1071,7 @@ class App(tk.Tk):
         self.card_job = None
         self.set_card_enabled(True)
         self.pending = Pending(self._scan_id, rd, hold=hold, timings=dict(upd.timings))
+        self.scroll_mid(False)
         self.show_reading(rd)
         self.set_banner("CHECK THIS SLIP", WARN)
         self.name_var.set("")
@@ -823,13 +1106,64 @@ class App(tk.Tk):
         job = self.jobs.get(key) if kind == "job" else None
         if job is not None:
             job.t_started = t0                            # (a plain float store: safe from this thread)
+        with self._busy_lock:
+            self._busy += 1
         try:
-            res = reader.read(name_crop, title_crop)
-        except Exception as e:
-            res = NameResult(error=f"name reading failed ({e.__class__.__name__})")
-        self.events.put(("name", kind, key, res, (time.perf_counter() - t0) * 1000))
+            try:
+                res = reader.read(name_crop, title_crop)
+            except Exception as e:
+                res = NameResult(error=f"name reading failed ({e.__class__.__name__})")
+            self.events.put(("name", kind, key, res, (time.perf_counter() - t0) * 1000))
+        finally:
+            with self._busy_lock:
+                self._busy -= 1
+
+    def workers_busy(self) -> bool:
+        """Is any name request (job or card) still running in a pool thread? Such a thread would keep the process alive."""
+        with self._busy_lock:
+            return self._busy > 0
+
+    def note_reader_result(self, res: NameResult):
+        """Is the name reader itself working? READER_FAILS service failures in a row (key rejected, no credit, offline,
+        rate limit, no answer) raise ONE alert and switch Auto-enter off, so the operator types the names while the
+        slip is still in hand; the first read that works again clears it. A slip-specific failure (declined, unreadable
+        reply) neither counts nor resets."""
+        if res.error:
+            if res.systemic:
+                self._rd_fail += 1
+                if self._rd_fail >= READER_FAILS and not self._rd_down:
+                    self.reader_down(res.error)
+        else:
+            self._last_name_ok = time.perf_counter()
+            if self._rd_down:
+                self.reader_recovered()
+            self._rd_fail = 0
+
+    def reader_down(self, reason: str):
+        self._rd_down = True
+        self._rd_fail = max(self._rd_fail, READER_FAILS)
+        msg = (f"NAME READING IS NOT WORKING ({reason}). The picks are still entered, but the names come out as '?'. "
+               "Auto-enter is OFF: each slip waits on the card for you to type the name.")
+        self.breaker = self._reader_breaker = msg
+        if self.auto_var.get():
+            self.auto_var.set(False)
+        self.alert(msg, "reader")
+        self.log("READER_DOWN", reason=reason)
+        self.update_stats()
+
+    def reader_recovered(self):
+        self._rd_down = False
+        self.clear_alert("reader")
+        if self.breaker and self.breaker == self._reader_breaker:      # we switched it off, and nobody has touched it since
+            self.breaker = self._reader_breaker = ""
+            self.auto_var.set(True)
+        self.hint_var.set("Name reading works again.")
+        self.touch()                                      # a card that is open now waits for Enter, it is not auto-written
+        self.log("READER_OK")
+        self.update_stats()
 
     def on_name(self, kind: str, key: int, res: NameResult, ms: float):
+        self._last_name_done = time.perf_counter()
         if kind == "job":
             job = self.jobs.get(key)
             if job is not None:
@@ -838,6 +1172,12 @@ class App(tk.Tk):
             self.on_card_name(key, res)
 
     def on_card_name(self, scan_id: int, res: NameResult):
+        try:
+            self._show_card_name(scan_id, res)
+        finally:
+            self.note_reader_result(res)                  # (after the name is filled in: a recovery touches the card)
+
+    def _show_card_name(self, scan_id: int, res: NameResult):
         p = self.pending
         if p is None or p.id != scan_id:
             return
@@ -859,10 +1199,11 @@ class App(tk.Tk):
             self.jor_note.set(f"Slip: JORNADA {res.jornada}")
             self.jor_lbl.configure(foreground=GOOD)
 
-    def apply_name(self, job: Job, res: NameResult, ms: float):
+    def apply_name(self, job: Job, res: NameResult, ms: float, *, beep: bool = True):
         """The name of an entered slip is back (possibly out of order, seconds after the next slip went in)."""
         if job.name_done:                                 # undone meanwhile, or already timed out: ignore the late one
             return
+        self.note_reader_result(res)
         job.name_ms = ms
         job.jornada = res.jornada
         marker = self.cfg.unsure_marker
@@ -898,7 +1239,7 @@ class App(tk.Tk):
             self.show_card_name(job)
         if self.rev_job is job:
             self.on_tree_select()
-        if state != "ok":
+        if state != "ok" and beep and self._rd_fail < READER_FAILS:    # (once the reader is down: one alert, no beep per slip)
             self.beep(True)
         self.settle(job)
         self.update_stats()
@@ -924,26 +1265,53 @@ class App(tk.Tk):
         self.log("BREAKER", msg=msg)
 
     def on_auto_change(self):
-        if self.auto_var.get() and self.breaker:
-            self.breaker = ""
+        if not self.auto_var.get():
+            return
+        if self.breaker:
+            self.breaker = self._reader_breaker = ""
             self.clear_alert("breaker")
+        if self._rd_down:                                 # the operator takes over again: count reader failures anew
+            self._rd_down, self._rd_fail = False, 0
+            self.clear_alert("reader")
+            self.update_stats()
 
     def check_jobs(self, now: float):
         """Give up on names that never came back (a hung request must not leave a hole in the sheet).
         The clock runs from the moment a worker starts the request - a name that merely waits its turn in a busy pool
-        is not late - with a generous cap on the waiting itself in case every worker is stuck."""
+        is not late - with a generous cap on the waiting itself in case every worker is stuck (and only while no
+        request at all has finished for a whole timeout: a pool that is making progress is just slow)."""
         limit = self.cfg.name_timeout_s
         if limit <= 0:
             return
+        queued_wait, hung = 0.0, []
         for job in self.entries:
-            if job.state != "reading" or not job.t_submit:
+            if job.state != "reading":
                 continue
-            since = now - job.t_started if job.t_started else None
-            if (since is not None and since > limit) or (since is None and now - job.t_submit > 4 * limit):
-                self.apply_name(job, NameResult(error=f"no answer after {limit:g} s" if since is not None else
-                                                "no free name reader"), (now - job.t_submit) * 1000)
-                if job.future is not None:
+            sub = job.t_submit or job.t_enter                 # (a job that never got its request is timed from its creation)
+            if job.t_started:
+                since = now - job.t_started
+                if since > limit:
+                    self.apply_name(job, NameResult(error=f"no answer after {limit:g} s", systemic=True), (now - sub) * 1000)
+                    if job.future is not None:
+                        job.future.cancel()
+                elif since > max(READER_HANG_S, limit / 2):
+                    hung.append(job)
+            elif job.future is None:                          # the Excel row exists but no name request was ever made
+                if now - sub > limit:
+                    self.apply_name(job, NameResult(error="name request never started"), (now - sub) * 1000)
+            else:
+                queued_wait = max(queued_wait, now - sub)
+                if now - sub > 4 * limit and now - self._last_name_done > limit:
+                    self.apply_name(job, NameResult(error="no free name reader", systemic=True), (now - sub) * 1000)
                     job.future.cancel()
+        # several requests silent for a long time and nothing answered since they started: the reader is down, say so now
+        # instead of waiting for every one of them to hit the timeout
+        if len(hung) >= READER_FAILS and not self._rd_down and self._last_name_ok < min(j.t_started for j in hung):
+            self.reader_down("Claude is not answering")
+        warn = queued_wait > 10
+        if warn != self._queue_warn:                          # (update_stats only runs on events: refresh when this flips)
+            self._queue_warn = warn
+            self.update_stats()
 
     # ------------------------------------------------------- finishing a job
     def settle(self, job: Job):
@@ -954,7 +1322,7 @@ class App(tk.Tk):
         rd = job.reading
         if rd is not None and job.state != "undone":
             try:
-                self.io.submit(self.audit.record, rd, job.picks, job.written or "", job.workbook, job.receipt.sheet,
+                self.io.submit(self._audit_task, rd, job.picks, job.written or "", job.workbook, job.receipt.sheet,
                                job.receipt.row, job.ticket, job.text if job.manual else job.state)
             except RuntimeError:
                 pass
@@ -962,8 +1330,24 @@ class App(tk.Tk):
                  status=job.state, name=job.written, reason=job.reason or None, fp_ms=job.fp_ms, feed_ms=job.feed_ms,
                  ui_ms=job.ui_ms, lag_ms=job.lag_ms, cycle_s=job.cycle_s, manual=job.manual or None)
         job.reading = None
-        if not job.review and len(self.entries) - job.id >= KEEP_CROPS:
+        if job.review:                                    # a row the operator still has to fix keeps its picture, as a
+            if job.name_crop is not None:                 # small JPEG (the session may be long and every row can fail)
+                job.crop_jpg = _jpeg(job.name_crop) or job.crop_jpg
+                if job.crop_jpg is not None:
+                    job.name_crop = None
+        elif len(self.entries) - job.id >= KEEP_CROPS:
             job.name_crop = None
+
+    def _audit_task(self, rd, picks, name, workbook, sheet, row, ticket, status):
+        """io thread: write the audit picture + CSV row; a failure goes to scanner.log and (once) to the operator."""
+        self.audit.record(rd, picks, name, workbook, sheet, row, ticket, status)
+        err = self.audit.last_error
+        if err:
+            self.scanlog.line("AUDIT_ERROR", ticket=ticket, err=err)
+            self.events.put(("audit", err))
+
+    def on_audit(self, err: str):
+        self.alert(f"AUDIT LOG PROBLEM - {err}. The slips are still entered in Excel; see scanner.log.", "audit", beep=False)
 
     # ----------------------------------------------------- tag / name helpers
     def active_tag(self) -> str:
@@ -1011,6 +1395,8 @@ class App(tk.Tk):
 
     def pick_edited(self, i: int):
         self.touch()
+        if self.pending is not None:
+            self.pending.edited.add(i)
         lbl, note = self.pick_lbls[i]
         lbl.configure(foreground="black")
         note.configure(text="")
@@ -1061,6 +1447,12 @@ class App(tk.Tk):
             self.status_var.set("Type the name first.")
             return
         picks = [v.get() for v in self.pick_vars]
+        unresolved = [i + 1 for i, v in enumerate(p.reading.verdicts)      # two marks / faint / scribbled, still on 'empty'
+                      if v not in (sv.OK, sv.BLANK) and not picks[i] and i not in p.edited]
+        if unresolved and not messagebox.askyesno(
+                "Unresolved row", f"Row {', '.join(map(str, unresolved))} of the slip could not be read and still says "
+                f"{self.marker} (empty).\n\nWrite {self.marker} anyway?"):
+            return
         shown = [x or self.marker for x in picks]
         final_name = self.final_name(name)
         snap, exp = self.tag_snapshot(), self.expected_jornada()
@@ -1130,6 +1522,7 @@ class App(tk.Tk):
                 self.tree.selection_set(job.iid)
                 self.tree.see(job.iid)
                 self.on_tree_select()
+                self.scroll_mid(True)                     # (small screen: bring the review panel into view)
                 return
         self.rev_info.set("Nothing to review.")
 
@@ -1142,8 +1535,9 @@ class App(tk.Tk):
             self.rev_info.set("Select a row to see its name picture.")
         else:
             self.rev_info.set(f"Ticket {job.ticket}: {job.text}")
-        if usable and job.name_crop is not None:
-            self._photos["rev"] = _to_photo(job.name_crop, width=460)
+        crop = job.crop() if usable else None
+        if crop is not None:
+            self._photos["rev"] = _to_photo(crop, width=self.rev_w)
             self.rev_img.configure(image=self._photos["rev"])
         else:
             self.rev_img.configure(image="")
@@ -1200,6 +1594,7 @@ class App(tk.Tk):
             self.alert(f"Undo failed: {e}")
             return
         was_reading = job.state == "reading"
+        self._entered_msg = ""                            # (the status bar must not go on saying 'Entered ticket N')
         job.state, job.text, job.written = "undone", "UNDONE", None
         if job.future is not None:
             job.future.cancel()
@@ -1212,7 +1607,7 @@ class App(tk.Tk):
         self.log("UNDO", ticket=job.ticket, while_reading=was_reading or None)
         if self.rev_job is job:
             self.on_tree_select()
-        job.reading = job.name_crop = None
+        job.reading = job.name_crop = job.crop_jpg = None
         self.refresh_blocks()
         self.update_stats()
 
@@ -1234,13 +1629,20 @@ class App(tk.Tk):
         waiting = sum(j.state == "reading" for j in self.entries)
         if waiting:
             parts.append(f"names being read: {waiting}")
+        if self._queue_warn:
+            parts.append("names are queueing: Claude is slower than the stack - raise name_workers")
+        if self.dupes_skipped:
+            parts.append(f"Skipped repeats: {self.dupes_skipped}")
         if self.backlog:
             parts.append(f"slips waiting behind the card: {len(self.backlog)}")
+        if self._rd_down:
+            parts.append("NAME READER DOWN")
         review = sum(j.review for j in self.entries)
         if review:
             parts.append(f"TO REVIEW: {review}")
         self.stats_var.set("     |     ".join(parts))
-        self.stats_lbl.configure(foreground=BAD if review else "#222")
+        self.stats_lbl.configure(foreground=BAD if (review or self.backlog or self._rd_down) else
+                                 WARN if self._queue_warn else "#222")
 
     # --------------------------------------------------------- main loop
     def tick(self):
@@ -1251,7 +1653,14 @@ class App(tk.Tk):
         if not self.closing:
             self._tick_id = self.after(TICK_MS, self.tick)
 
-    def _tick(self):
+    def _stage(self, fn, *args):
+        """One stage of the tick: a bug in it must not stop the stages after it (the name time-outs, the backlog ...)."""
+        try:
+            fn(*args)
+        except Exception as e:
+            self.report_callback_exception(type(e), e, e.__traceback__)
+
+    def _events(self):
         for _ in range(50):
             try:
                 ev = self.events.get_nowait()
@@ -1262,16 +1671,23 @@ class App(tk.Tk):
                     self.on_scan(ev[1], ev[2] if len(ev) > 2 else None)
                 elif ev[0] == "name":
                     self.on_name(ev[1], ev[2], ev[3], ev[4])
+                elif ev[0] == "audit":
+                    self.on_audit(ev[1])
             except Exception as e:            # one bad event must not drop the ones behind it
                 self.report_callback_exception(type(e), e, e.__traceback__)
+
+    def _tick(self):
         now = time.perf_counter()
-        if now >= self._next_preview:
-            self.render_preview(now)
+        self._stage(self._events)
         if now >= self._next_watch:
             self._next_watch = now + 0.25
-            self.check_jobs(now)
+            self._stage(self.check_jobs, now)
+        if self.backlog and self.pending is None:         # safety net: slips never wait without a card in front of them
+            self._stage(self.drain_backlog)
+        if now >= self._next_preview:
+            self._stage(self.render_preview, now)
         if self.pending is not None:
-            self.maybe_auto()
+            self._stage(self.maybe_auto)
 
     def render_preview(self, now: float):
         """~15 fps, only when there is a new frame, and the full-size picture is never copied or converted."""
@@ -1286,8 +1702,8 @@ class App(tk.Tk):
         self._prev_fid = fid
         self._next_preview = now + 1.0 / PREVIEW_FPS
         h, w = frame.shape[:2]
-        s = PREVIEW_W / w
-        small = cv2.resize(frame, (PREVIEW_W, max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+        s = self.preview_w / w
+        small = cv2.resize(frame, (self.preview_w, max(1, round(h * s))), interpolation=cv2.INTER_AREA)
         quad = None if upd.quad is None else np.asarray(upd.quad, np.float32) * s
         vis = sv.draw_quad(small, quad, (0, 200, 0) if upd.progress >= 1 else (0, 200, 255), 2)
         img = Image.fromarray(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
@@ -1298,10 +1714,10 @@ class App(tk.Tk):
             self.preview.configure(image=self._prev_photo)
         if self.pending is None:
             msg = upd.message
-            if self._entered_msg and upd.state == WAIT_REMOVE and not upd.duplicate and not upd.error:
-                msg = self._entered_msg
-            elif upd.state != WAIT_REMOVE:
-                self._entered_msg = ""
+            if upd.state != WAIT_REMOVE:
+                self._entered_msg, self._dup_latched = "", False
+            elif self._entered_msg and not upd.duplicate and not upd.error and not self._dup_latched:
+                msg = self._entered_msg                   # (a dropped repeat keeps the engine's 'lift it off' text instead)
             if self.status_var.get() != msg:
                 self.status_var.set(msg)
         if self.progress["value"] != upd.progress:
@@ -1332,14 +1748,58 @@ class App(tk.Tk):
         self.shutdown()
         super().destroy()
 
+    def finish_names(self, wait: float):
+        """Closing: pump Tk until the names that are still being read have come back (at most ``wait`` s), then give up on
+        the rest the way a timeout does - '?' in the cell, a review row, the audit picture and the CSV row."""
+        def pending_names():
+            return [j for j in self.entries if j.state == "reading" and j.future is not None]
+        end = time.perf_counter() + wait
+        while pending_names() and time.perf_counter() < end:
+            self.status_var.set(f"Closing - waiting for {len(pending_names())} name(s) still being read ...")
+            try:
+                self.update()                             # lets tick() deliver the 'name' events (apply_name -> settle)
+            except tk.TclError:
+                return
+            time.sleep(0.02)
+        for job in list(self.entries):
+            if job.state == "reading":
+                try:
+                    self.apply_name(job, NameResult(error="app closed before the name came back"), 0.0, beep=False)
+                except Exception as e:
+                    self.log("CLOSE_ERROR", ticket=job.ticket, err=repr(e))
+
     def on_close(self):
-        self.cfg.name_tag = self.tag_var.get().strip()
-        self.cfg.name_tag_position = self.tag_pos.get()
-        self.cfg.auto_enter = self.auto_var.get() or bool(self.breaker)   # the breaker's "off" is for this session only
-        self.cfg.autofocus = self.af_var.get()
-        self.cfg.manual_focus = int(self.focus_var.get())
-        self.cfg.save()
-        self.destroy()
+        if self._close_started:
+            return
+        unentered = (1 if self.pending is not None else 0) + len(self.backlog)
+        if unentered:
+            self._close_started = True                    # (the dialog keeps the event loop running: no second close)
+            try:
+                go = messagebox.askyesno("Close", f"{unentered} slip(s) are NOT in Excel yet "
+                                         f"({1 if self.pending is not None else 0} on the card, {len(self.backlog)} "
+                                         "waiting behind it).\n\nClose anyway and lose them?")
+            finally:
+                self._close_started = False
+            if not go:
+                return
+            self.log("CLOSE_DROPPED", card=1 if self.pending is not None else 0, backlog=len(self.backlog))
+        self._close_started = True
+        try:
+            self._stop_camera()                           # no new slips while the names are collected
+            self.finish_names(CLOSE_WAIT_S)
+            self.flush_io()                               # the audit pictures / CSV rows / log lines of those names
+        except Exception as e:
+            self.log("CLOSE_ERROR", err=repr(e))
+        finally:
+            try:
+                self.cfg.name_tag = self.tag_var.get().strip()
+                self.cfg.name_tag_position = self.tag_pos.get()
+                self.cfg.auto_enter = self.auto_var.get() or bool(self.breaker)   # the breaker's "off" is for this session only
+                self.cfg.autofocus = self.af_var.get()
+                self.cfg.manual_focus = int(self.focus_var.get())
+                self.cfg.save()
+            finally:
+                self.destroy()
 
 
 def run(cfg: Config, source=None, backend=None):
@@ -1351,8 +1811,9 @@ def run(cfg: Config, source=None, backend=None):
             pass
     app = App(cfg, source, backend)
     app.mainloop()
-    if app.names_in_flight():
-        # a name request that is still hanging would keep this process alive (non-daemon pool threads)
+    if app.workers_busy() or app.names_in_flight():
+        # a name request that is still hanging (even one the app already gave up on) would keep this process alive for
+        # up to a minute: pool threads are non-daemon and joined at exit. Everything is saved and flushed by now.
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

@@ -40,6 +40,7 @@ class NameResult:
     jornada: str | None = None
     legible: bool = False
     error: str | None = None
+    systemic: bool = False     # the failure is about the service (key, credit, line, rate limit), not about this slip
 
 
 def _jpeg_b64(img: np.ndarray, max_w: int = MAX_IMAGE_W) -> str:
@@ -115,18 +116,18 @@ class ClaudeNameReader:
                 output_config={"effort": self.effort},
                 messages=[{"role": "user", "content": content}],
             )
-        except a.AuthenticationError:
-            return NameResult(error="Anthropic API key rejected")
+        except a.AuthenticationError:                # (systemic: the same answer is coming for every slip)
+            return NameResult(error="Anthropic API key rejected", systemic=True)
         except a.RateLimitError:
-            return NameResult(error="Anthropic rate limit")
+            return NameResult(error="Anthropic rate limit", systemic=True)
         except a.APITimeoutError:                    # before APIConnectionError, which it subclasses
-            return NameResult(error="Claude took too long")
+            return NameResult(error="Claude took too long", systemic=True)
         except a.APIConnectionError:
-            return NameResult(error="no internet")
-        except a.APIStatusError as e:
-            return NameResult(error=f"Anthropic API error {e.status_code}")
+            return NameResult(error="no internet", systemic=True)
+        except a.APIStatusError as e:                # 400 = no credit left, 5xx = overloaded, ...
+            return NameResult(error=f"Anthropic API error {e.status_code}", systemic=True)
         except a.APIError as e:
-            return NameResult(error=f"Anthropic API error ({e.__class__.__name__})")
+            return NameResult(error=f"Anthropic API error ({e.__class__.__name__})", systemic=True)
         if resp.stop_reason == "refusal":
             return NameResult(error="Claude declined to read this one")
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")

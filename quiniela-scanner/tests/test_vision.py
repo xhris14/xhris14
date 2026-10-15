@@ -75,3 +75,23 @@ def test_unrelated_printed_table_is_rejected():
         cv2.line(img, (x, 300), (x, 700), (30, 30, 30), 3)
     with pytest.raises(sv.SlipNotFound):
         sv.locate_grid(img)
+
+
+def test_occluded_is_a_problem_row_and_is_drawn():
+    """E2: the OCCLUDED verdict is part of the vocabulary - never clean, never a pick - and draw_reading shows it."""
+    import dataclasses
+    rd = _read(on_webcam_canvas(draw_slip(PICKS, rng=np.random.default_rng(7)), scale=0.5, angle=4))
+    assert sv.OCCLUDED == "occluded" and rd.clean and rd.occluded_rows == []
+    covered = dataclasses.replace(rd, picks=["", ""] + rd.picks[2:], verdicts=[sv.OCCLUDED, sv.OCCLUDED] + rd.verdicts[2:],
+                                  candidates=[(), ()] + rd.candidates[2:])
+    assert not covered.clean and covered.occluded_rows == [0, 1] and covered.problem_rows == [0, 1]
+    img = sv.draw_reading(covered)
+    assert img.shape == rd.rectified.shape and not (img == sv.draw_reading(rd)).all()
+
+
+def test_read_slip_can_reuse_a_grid_and_skin_defaults_are_off_for_a_clean_slip():
+    frame = on_webcam_canvas(draw_slip(PICKS, rng=np.random.default_rng(7)), scale=0.5, angle=4)
+    g = sv.locate_grid(frame)
+    rd = sv.read_slip(frame, grid=g)
+    assert rd.picks == PICKS and rd.grid is g
+    assert rd.skin_fraction == 0.0 and not rd.hand and not rd.name_hidden

@@ -11,9 +11,23 @@ scanner.log (next to config.json) gets one line per entered slip with its timing
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .config import Config
+
+
+def _write_image(path: str, img) -> bool:
+    """cv2.imwrite returns False (no exception) for a path it cannot write and cannot do non-ANSI paths on Windows."""
+    import cv2
+    ext = os.path.splitext(path)[1] or ".png"
+    try:
+        ok, buf = cv2.imencode(ext, img)
+        if ok:
+            buf.tofile(path)
+        return bool(ok)
+    except (OSError, cv2.error):
+        return False
 
 
 def cmd_scan(args, cfg: Config) -> int:
@@ -32,9 +46,13 @@ def cmd_scan(args, cfg: Config) -> int:
         print(f"  match {i}: {p or '-':1s}  {v:8s}  ink L/E/V = " + " / ".join(f"{x:.3f}" for x in ink))
     print("picks:", " ".join(p or "-" for p in rd.picks), "| clean" if rd.clean else "| NEEDS CHECK")
     if args.out:
-        cv2.imwrite(args.out, sv.draw_reading(rd))
-        cv2.imwrite(args.out.replace(".", "_name.", 1), rd.name_crop)
-        print("wrote", args.out)
+        root, ext = os.path.splitext(args.out)
+        name_out = f"{root}_name{ext or '.png'}"              # r.jpg -> r_name.jpg (also for ./dir.x/r.jpg)
+        for path, img in ((args.out, sv.draw_reading(rd)), (name_out, rd.name_crop)):
+            if not _write_image(path, img):
+                print(f"cannot write {path}")
+                return 2
+            print("wrote", path)
     if args.name:
         from .name_reader import make_reader
         reader, note = make_reader(True, cfg.claude_model, cfg.claude_effort)
@@ -86,8 +104,16 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     from .config import load_dotenv
-    load_dotenv()
+    try:
+        env_note = load_dotenv()
+    except Exception as e:                                # a bad .env must never stop the program from starting
+        env_note = f".env could not be read ({e.__class__.__name__}) - the API key was not loaded."
     cfg = Config.load()                                   # an old config.json is migrated here (see config.py)
+    if env_note:
+        cfg.notes.append(env_note)
+    if args.cmd:
+        for note in cfg.notes:
+            print("NOTE:", note, file=sys.stderr)
     if args.camera is not None:
         cfg.camera_index = args.camera
     if args.xlsx:

@@ -27,6 +27,50 @@ class FakeComError(Exception):
         self.hresult = hresult
 
 
+class PyWinComError(Exception):
+    """Same shape as pywintypes.com_error when the callee (Excel) fails inside IDispatch::Invoke: .hresult is
+    DISP_E_EXCEPTION and Excel's own code - 0x800AC472 'cell in edit mode' - is only in excepinfo[5]."""
+
+    def __init__(self, scode, hresult=-2147352567, msg="Exception occurred."):
+        self.hresult, self.strerror, self.argerror = hresult, msg, None
+        self.excepinfo = (0, None, None, None, 0, scode)
+        super().__init__(self.hresult, self.strerror, self.excepinfo, self.argerror)
+
+
+VBA_E_IGNORE = -2146777998             # 0x800AC472
+E_FORMAT_DENIED = -2146827284          # 0x800A03EC: "Unable to set the Size property of the Font class"
+
+
+_MONTH3 = {"ENE", "FEB", "MAR", "ABR", "MAY", "JUN", "JUL", "AGO", "SEP", "SET", "OCT", "NOV", "DIC",
+           "JAN", "APR", "AUG", "DEC"}
+
+
+def excel_would_convert(s):
+    """What Excel does to a string assigned with Range.Value into a General cell: True if the cell would NOT
+    end up holding exactly this text (formula, number, date, time, boolean, error value, eaten apostrophe).
+    Written independently of excel_sink.needs_text_prefix so the two can disagree."""
+    t = s.strip()
+    if not t:
+        return False
+    if t[0] in "=+-@'" or t.upper() in ("TRUE", "FALSE", "VERDADERO", "FALSO") or \
+            t.upper() in ("#N/A", "#REF!", "#NAME?", "#VALUE!", "#DIV/0!", "#NUM!", "#NULL!"):
+        return True
+    num = t.strip("()%$").replace("\u20ac", "").replace("\u00a3", "").strip()
+    for cand in (num, num.replace(",", ""), num.replace(".", "").replace(",", ".")):
+        try:
+            float(cand)
+            return True
+        except ValueError:
+            pass
+    if re.match(r"^\d{1,4}\s*[/\-.:]\s*\d{1,4}(\s*[/\-.:]\s*\d{1,4})?$", t) or \
+            re.match(r"^\d{1,2}(:\d{2}){1,2}\s*([AP]\.?M\.?)?$", t, re.I) or re.match(r"^\d{1,2}\s*[AP]\.?M\.?$", t, re.I) \
+            or re.match(r"^[\d\s,./:\-]+$", t):
+        return True
+    m = re.match(r"^(\d{1,2})[\s\-/.]*([A-Za-z]+)\.?([\s\-/.,]*\d{1,4})?$", t) or \
+        re.match(r"^([A-Za-z]+)\.?[\s\-/.,]*(\d{1,4})([\s\-/.,]*\d{1,4})?$", t)
+    return bool(m and any(g and g.upper()[:3] in _MONTH3 and g.isalpha() and len(g) <= 10 for g in m.groups()))
+
+
 class Meter:
     def __init__(self, trip_ms=0.5, cell_ms=0.002):
         self.ops = Counter()                # data operations by kind
@@ -88,6 +132,8 @@ class FakeRangeFont:
         cells = self.rng.cells()
         self.rng.ws.meter.op("font_set", len(cells))
         self.rng.ws.check_busy()
+        if self.rng.ws.protect_formats:
+            raise PyWinComError(E_FORMAT_DENIED)
         for c in cells:
             self.rng.ws.fonts[c] = v
 
@@ -110,8 +156,32 @@ class FakeRange:
         r1, c1, r2, c2 = self.areas[0]
         self.ws.meter.op("value_get", (r2 - r1 + 1) * (c2 - c1 + 1))
         self.ws.check_dead()
+        self.ws.read_log.append((r2 - r1 + 1, c2 - c1 + 1))
         rows = tuple(tuple(self.ws.cells.get((r, c)) for c in range(c1, c2 + 1)) for r in range(r1, r2 + 1))
         return rows[0][0] if len(rows) == 1 and len(rows[0]) == 1 else rows
+
+    @property
+    def Formula(self):
+        """Formula text where there is a formula, else the constant ('' for an empty cell), like Excel."""
+        assert len(self.areas) == 1
+        r1, c1, r2, c2 = self.areas[0]
+        self.ws.meter.op("formula_get", (r2 - r1 + 1) * (c2 - c1 + 1))
+        self.ws.check_dead()
+        if self.ws.formula_error:
+            raise self.ws.formula_error
+        def one(k):
+            if k in self.ws.formulas:
+                return "=" + str(self.ws.formula_text.get(k, "F()"))
+            v = self.ws.cells.get(k)
+            return "" if v is None else v
+        rows = tuple(tuple(one((r, c)) for c in range(c1, c2 + 1)) for r in range(r1, r2 + 1))
+        return rows[0][0] if len(rows) == 1 and len(rows[0]) == 1 else rows
+
+    @property
+    def NumberFormat(self):
+        self.ws.meter.op("numfmt", len(self.cells()))
+        self.ws.check_dead()
+        return "@" if all(c in self.ws.text_cells for c in self.cells()) else "General"
 
     @Value.setter
     def Value(self, v):
@@ -130,6 +200,37 @@ class FakeCellRef:
     def __init__(self, r, c):
         self.r, self.c = r, c
 
+    @property
+    def Row(self):
+        return self.r
+
+    @property
+    def Column(self):
+        return self.c
+
+
+class FakeCells:
+    """Worksheet.Cells: callable as Cells(row, col) and offers Find (the last used column / row idiom)."""
+
+    def __init__(self, ws):
+        self.ws = ws
+
+    def __call__(self, r, c):
+        self.ws.meter.trip()
+        return FakeCellRef(r, c)
+
+    def Find(self, What="*", After=None, LookIn=None, LookAt=None, SearchOrder=None, SearchDirection=None, **kw):
+        self.ws.meter.op("find", trips=2)
+        if self.ws.find_error:
+            raise self.ws.find_error
+        keys = [k for k, v in self.ws.cells.items() if v is not None]
+        assert What == "*" and SearchDirection == 2, "only the 'last used cell' idiom is modelled"
+        if not keys:
+            return None
+        if SearchOrder == 2:                 # xlByColumns: the last column, then its last row
+            return FakeCellRef(*max((c, r) for r, c in keys)[::-1])
+        return FakeCellRef(*max(keys))       # xlByRows: the last row, then its last column
+
 
 class FakeSheet:
     def __init__(self, name, cells, meter, formulas=()):
@@ -140,6 +241,13 @@ class FakeSheet:
         self.converted = set()              # strings Excel would have turned into a number / date
         self.dead = False                   # simulate a Worksheet object whose workbook was closed
         self.busy = 0                       # next N writes fail with "call rejected"
+        self.text_cells = set()             # cells whose NumberFormat is "@" (an apostrophe would show literally)
+        self.formula_text = {}              # (r, c) -> formula text for Range.Formula (default "=F()")
+        self.formula_error = None           # exception raised by Range.Formula
+        self.protect_formats = False        # Font.Size assignment is refused (protected sheet, no 'Format cells')
+        self.used_extra = (0, 0)            # UsedRange inflated by empty formatted rows / columns
+        self.find_error = None              # exception raised by Cells.Find
+        self.read_log = []                  # (rows, cols) of every Range.Value read
 
     # -- what Excel does with an assignment
     def put(self, key, x):
@@ -148,13 +256,16 @@ class FakeSheet:
         self.converted.discard(key)
         if x is None:
             self.cells.pop(key, None)
+        elif isinstance(x, str) and key in self.text_cells:     # Text format: stored as typed, apostrophe included
+            self.cells[key] = x
+            self.texts.add(key)
         elif isinstance(x, str) and x.startswith("'"):
             self.cells[key] = x[1:]
             self.texts.add(key)
         elif isinstance(x, str) and x.startswith("="):
             self.cells[key] = 0
             self.formulas.add(key)
-        elif isinstance(x, str) and re.match(r"^[+\-@]|^[\d\s\-/.:,]+$", x):
+        elif isinstance(x, str) and excel_would_convert(x):
             self.cells[key] = x
             self.converted.add(key)
         else:
@@ -178,22 +289,23 @@ class FakeSheet:
             return FakeRange(self, parse_areas(a))
         return FakeRange(self, [(a.r, a.c, b.r, b.c)])
 
-    def Cells(self, r, c):
-        self.meter.trip()
-        return FakeCellRef(r, c)
+    @property
+    def Cells(self):
+        return FakeCells(self)
 
     @property
     def UsedRange(self):
         self.meter.op("usedrange", trips=5)
         rs = [k[0] for k in self.cells] or [1]
         cs = [k[1] for k in self.cells] or [1]
+        extra_r, extra_c = self.used_extra
 
         class Cnt:
             def __init__(s, n): s.Count = n
 
         class U:
             Row, Column = min(rs), min(cs)
-            Rows, Columns = Cnt(max(rs) - min(rs) + 1), Cnt(max(cs) - min(cs) + 1)
+            Rows, Columns = Cnt(max(rs) - min(rs) + 1 + extra_r), Cnt(max(cs) - min(cs) + 1 + extra_c)
         return U
 
     # -- what the USER does in Excel (not counted)
@@ -240,8 +352,12 @@ class FakeBook:
         self.Name, self.meter = name, meter
         self.Worksheets = FakeSheets(meter, sheets)
 
+    save_error = None
+
     def Save(self):
         self.meter.op("save")
+        if self.save_error:
+            raise self.save_error
 
 
 class FakeBooks:

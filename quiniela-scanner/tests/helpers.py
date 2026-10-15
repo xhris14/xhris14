@@ -304,3 +304,70 @@ def draw_unreadable_form(width=1000, height=1050):
     for x in (100, 400, 900):
         cv2.line(img, (x, 200), (x, 800), (30, 30, 30), 4)
     return img
+
+
+# ----------------------------------------------------------------------------- hands, odd marks and a virtual clock
+# (hand guard / mark guard / stack-at-low-fps tests)
+SLIP_X = (8, 72, 136, 200)             # draw_slip: the rules around the L / E / V columns ...
+SLIP_Y0, SLIP_ROW = 160, 80            # ... the top of the first match row and the row height
+
+
+def with_hand(frame, x, y, angle=200.0, size=1.7, tone=(110, 150, 205)):
+    """A copy of ``frame`` with a skin-coloured hand (see draw_hand) resting at (x, y)."""
+    out = frame.copy()
+    draw_hand(out, x, y, angle, size, tone)
+    return out
+
+
+def cell_centre(r, c):
+    """Centre (x, y) of the L/E/V cell of match row ``r``, column ``c`` in a draw_slip image."""
+    return (SLIP_X[c] + SLIP_X[c + 1]) // 2, SLIP_Y0 + r * SLIP_ROW + SLIP_ROW // 2
+
+
+def _blend(img, draw, alpha):
+    if alpha >= 1.0:
+        draw(img)
+        return img
+    ov = img.copy()
+    draw(ov)
+    img[:] = cv2.addWeighted(ov, alpha, img, 1 - alpha, 0)
+    return img
+
+
+def draw_cross(img, r, c, size=48, thick=4, ink=(170, 60, 25), dx=0, dy=0, alpha=1.0):
+    """An X of ``size`` px (a faint one: ``alpha`` < 1 blends the ink into the paper) in cell (r, c), shifted by (dx, dy)."""
+    cx, cy = cell_centre(r, c)
+    cx, cy, s = cx + dx, cy + dy, size // 2
+
+    def draw(im):
+        cv2.line(im, (cx - s, cy - s), (cx + s, cy + s), ink, thick, cv2.LINE_AA)
+        cv2.line(im, (cx + s, cy - s), (cx - s, cy + s), ink, thick, cv2.LINE_AA)
+    return _blend(img, draw, alpha)
+
+
+def draw_scribble(img, r, c, strokes=8, thick=5, ink=(170, 60, 25), half=30):
+    """A zigzag scribbled over cell (r, c): a crossed-out mark."""
+    cx, cy = cell_centre(r, c)
+    pts = [(cx - half if i % 2 == 0 else cx + half, cy - half + (2 * half * i) // max(strokes - 1, 1)) for i in range(strokes)]
+    for a, b in zip(pts[:-1], pts[1:]):
+        cv2.line(img, a, b, ink, thick, cv2.LINE_AA)
+    return img
+
+
+def draw_staple(img, r, c, length=70, angle=20.0, thick=5, grey=(95, 95, 100), dx=0, dy=0):
+    """A long thin dark object lying in cell (r, c) at ``angle`` degrees (a staple, a pen slash)."""
+    cx, cy = cell_centre(r, c)
+    a = np.deg2rad(angle)
+    d = (int(round(np.cos(a) * length / 2)), int(round(np.sin(a) * length / 2)))
+    cv2.line(img, (cx + dx - d[0], cy + dy - d[1]), (cx + dx + d[0], cy + dy + d[1]), grey, thick, cv2.LINE_AA)
+    return img
+
+
+class VClock:
+    """A clock that only moves when told to: ``clock.t += 1 / 30`` per frame makes a test independent of the machine's speed."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t

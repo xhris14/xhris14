@@ -581,7 +581,7 @@ def test_wrong_jornada_marks_the_row_trips_the_breaker_and_can_be_undone(env, mk
     inject(app, reader, readings[1], good("BETO", jornada="10"))      # the next slip is clean ... but auto-enter is off
     assert pump(app, lambda: app.pending is not None)
     assert len(app.entries) == 1 and "CHECK THIS SLIP" in app.banner_var.get()
-    assert pump(app, lambda: app.engine.paused)                       # the classic card pauses the engine
+    assert not app.engine.paused                                      # a card never pauses the engine (G05/SOAK-1)
     assert pump(app, lambda: app.name_var.get() == "BETO")            # (its name is still read for the card)
     app.commit()
     assert row_of(backend, 1)[0] == "BETO" and app.pending is None and len(app.entries) == 2
@@ -620,7 +620,7 @@ def test_flagged_slip_uses_the_classic_card_and_never_refreshes_excel(env, mk, f
     inject(app, reader, flagged, good("ANA"))
     assert pump(app, lambda: app.pending is not None)
     assert len(app.entries) == 0 and "CHECK THIS SLIP" in app.banner_var.get() and beeps["attention"] == 1
-    assert pump(app, lambda: app.engine.paused) and app.write_btn.instate(["!disabled"])
+    assert not app.engine.paused and app.write_btn.instate(["!disabled"])
     assert pump(app, lambda: app.name_var.get() == "ANA")
     assert app.pick_vars[1].get() == "" and app.pick_vars[2].get() == ""
     app.pick_vars[1].set("E")
@@ -631,7 +631,7 @@ def test_flagged_slip_uses_the_classic_card_and_never_refreshes_excel(env, mk, f
     assert row_of(backend, 0) == ["ANA", "L", "E", "V", "E", "L", "L", "V", "E", "E"]
     assert app.pending is None and app.entries[0].state == "ok" and app.entries[0].text == "checked"
     assert backend.calls["snapshot"] == 2 and app.sink.refresh_count == 1       # no full re-read for the commit
-    assert pump(app, lambda: not app.engine.paused)
+    assert not app.engine.paused
 
 
 def test_a_slip_that_arrives_while_a_card_is_open_is_not_lost(env, mk, readings, flagged):
@@ -691,7 +691,7 @@ def test_excel_trouble_in_fast_mode_is_loud_and_falls_back_to_the_card(env, mk, 
     assert pump(app, lambda: app.pending is not None)
     assert "NOT ENTERED" in app.alert_var.get() and "busy" in app.alert_var.get() and beeps["attention"] >= 1
     assert "NOT ENTERED" in app.banner_var.get() and len(app.entries) == 0 and row_of(backend, 0) == [None] * 10
-    assert pump(app, lambda: app.engine.paused)
+    assert not app.engine.paused                                      # the hold card does not pause the engine either
     assert pump(app, lambda: app.name_var.get() == "ANA")
     app.commit()                                                      # Excel is fine again: the operator enters it
     assert row_of(backend, 0) == ["ANA"] + STACK[0][0] and app.alert_var.get() == ""
@@ -824,7 +824,7 @@ def test_preview_is_shrunk_before_drawing_and_skips_frames_it_already_showed(env
     monkeypatch.setattr(gui.sv, "draw_quad", lambda frame, quad, *a, **k: (seen.append(frame.shape), real(frame, quad, *a, **k))[1])
     app, _ = mk()
     assert pump(app, lambda: len(seen) >= 3, 5)
-    assert all(s[1] == gui.PREVIEW_W and s[0] < 400 for s in seen), seen[:3]     # never a 1080p frame
+    assert all(s[1] == app.preview_w and s[0] < 400 for s in seen), seen[:3]     # never a 1080p frame
     frame = np.full((1080, 1920, 3), 200, np.uint8)
     upd = Update("tracking", "Hold still...", np.array([[400, 300], [1500, 300], [1500, 900], [400, 900]], np.float32), 0.5)
     app._stop_camera()                                                # nothing else may touch the preview from here on
@@ -926,7 +926,7 @@ def test_a_current_config_keeps_what_the_user_chose(tmp_path):
 def test_defaults_and_save_write_only_what_differs(tmp_path):
     cfg = Config()
     assert (cfg.stable_frames, cfg.auto_enter_delay_s, cfg.auto_enter, cfg.name_workers, cfg.unsure_marker,
-            cfg.sounds, cfg.config_version, cfg.claude_model) == (4, 0.0, True, 3, " ?", True, 2, "claude-opus-5-5")
+            cfg.sounds, cfg.config_version, cfg.claude_model) == (4, 0.0, True, 6, " ?", True, 2, "claude-opus-5-5")
     path = tmp_path / "config.json"
     cfg.save(path)
     assert json.loads(path.read_text()) == {"config_version": CONFIG_VERSION}
@@ -1123,3 +1123,783 @@ def test_scanner_log_lines_and_rotation(tmp_path):
     finally:
         ScanLog.MAX_BYTES = 2_000_000
     assert (tmp_path / "scanner.log.1").exists() and "ticket=253" in (tmp_path / "scanner.log").read_text()
+
+
+# ======================================================================================= review round 2: slips behind a card
+NAMES = ["CLEMENTE O.", "ANA", "BETO", "CARLOS M.", "DOLORES", "PACO 2", "JUAN G.", "TONY 5000"]
+
+
+def fix_flagged_card(app, name="ana"):
+    app.pick_vars[1].set("E")
+    app.pick_edited(1)
+    app.pick_vars[2].set("V")
+    app.pick_edited(2)
+    app.name_var.set(name)
+
+
+def test_every_slip_queued_behind_a_card_is_entered_in_order_when_it_closes(env, mk, readings, flagged):
+    """G01 / SOAK-6: three slips wait behind one card; closing it used to enter only the first of them."""
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, flagged, good("ANA"))
+    assert pump(app, lambda: app.pending is not None)
+    for k in (1, 2, 3):
+        inject(app, reader, readings[k], good(NAMES[k]))
+    assert pump(app, lambda: len(app.backlog) == 3)
+    assert not app.engine.paused and len(app.entries) == 0
+    fix_flagged_card(app)
+    app.commit()
+    assert len(app.entries) == 4 and not app.backlog and app.pending is None
+    assert named(app, *app.entries)
+    assert [row_of(backend, k)[0] for k in range(4)] == ["ANA", "ANA", "BETO", "CARLOS M."]    # (names come from readings[k])
+    assert [row_of(backend, k)[1:] for k in range(1, 4)] == [STACK[k][0] for k in (1, 2, 3)]   # arrival order = ticket order
+    assert [j.ticket for j in app.entries] == [251, 252, 253, 254]
+
+
+def test_a_backlog_that_nobody_drained_heals_itself_in_the_tick(env, mk, readings):
+    """The safety net: slips never sit in the backlog without a card in front of them."""
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    for k in (0, 1):
+        rd = copy.copy(readings[k])
+        rd.name_crop = rd.name_crop.copy()
+        reader.expect(rd.name_crop, good(NAMES[k]))
+        app.backlog.append((Update(WAIT_REMOVE, "c", reading=rd, timings={}), time.perf_counter(), app.tag_snapshot()))
+    assert pump(app, lambda: len(app.entries) == 2 and not app.backlog)
+    assert [j.ticket for j in app.entries] == [251, 252]
+
+
+def test_slips_waiting_behind_a_card_are_loud(env, mk, readings, flagged):
+    """SOAK-1 / G05: attention beep when the first one queues up, a persistent alert with the count, gone once drained."""
+    tmp, beeps = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, flagged, good("ANA"))
+    assert pump(app, lambda: app.pending is not None)
+    n0 = beeps["attention"]                                           # (the card's own beep)
+    inject(app, reader, readings[1], good("BETO"))
+    assert pump(app, lambda: len(app.backlog) == 1)
+    assert beeps["attention"] == n0 + 1 and "1 slip is WAITING" in app.alert_var.get()
+    inject(app, reader, readings[2], good("CARLOS"))
+    assert pump(app, lambda: len(app.backlog) == 2)
+    assert beeps["attention"] == n0 + 1 and "2 slips are WAITING" in app.alert_var.get()   # no beep storm: 0 -> 1 only
+    assert "slips waiting behind the card: 2" in app.stats_var.get() and str(app.stats_lbl.cget("foreground")) == gui.BAD
+    fix_flagged_card(app)
+    app.commit()
+    assert not app.backlog and "WAITING" not in app.alert_var.get() and app.alert_var.get() == ""
+
+
+@pytest.fixture(scope="module")
+def flagged_parts():
+    """A stack whose FIRST slip needs a card (a double mark in row 3), followed by three clean ones."""
+    first = (["L", "", "LV", "E", "L", "L", "V", "E", "E"], "ANA", 21)
+    return Parts(specs=[first] + STACK[1:4])
+
+
+def test_a_stack_keeps_flowing_while_a_card_is_open_and_nothing_is_lost(env, mk, flagged_parts):
+    """SOAK-1 / G05 end to end, with the real engine: the slips the operator lifts and presents while the card is
+    still open are read (the engine is not paused) and entered, in order, right after the card is written."""
+    reader = ScriptedReader()
+    source = StackSource(Film(flagged_parts, hold=26))
+    app, backend = mk(source, reader)
+    feed = app.engine.feed
+    order, paused = ["ANA", "BETO", "CARLOS M.", "DOLORES"], []
+
+    def tap(frame):
+        paused.append(app.engine.paused)
+        upd = feed(frame)
+        if upd.reading is not None:
+            reader.expect(upd.reading.name_crop, good(order[len(reader.specs)]))
+        return upd
+    app.engine.feed = tap
+    assert pump(app, lambda: len(app.backlog) == 3, 30), (len(app.entries), len(app.backlog))
+    assert app.pending is not None and len(app.entries) == 0 and not any(paused)
+    fix_flagged_card(app)
+    app.commit()
+    assert pump(app, lambda: len(app.entries) == 4 and not app.backlog)
+    assert named(app, *app.entries)
+    assert [row_of(backend, k)[0] for k in range(4)] == order
+    assert [row_of(backend, k)[1:] for k in range(1, 4)] == [STACK[k][0] for k in (1, 2, 3)]
+
+
+def test_tag_of_a_slip_that_waited_behind_a_card_is_the_one_it_was_scanned_with(env, mk, readings, flagged):
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, flagged, good("ANA"))
+    assert pump(app, lambda: app.pending is not None)
+    app.tag_var.set("RRR")
+    app.tag_on.set(True)
+    app.pending.touched = False
+    inject(app, reader, readings[1], good("BETO"))                    # scanned with the tag ON ...
+    assert pump(app, lambda: len(app.backlog) == 1)
+    app.tag_on.set(False)                                             # ... the operator switches it off before closing the card
+    fix_flagged_card(app)
+    app.commit()
+    assert named(app, *app.entries) and row_of(backend, 1)[0] == "BETO RRR"
+
+
+# ======================================================================================= review round 2: closing the window
+def test_closing_waits_for_the_names_still_being_read_and_keeps_every_audit_row(env, mk, readings):
+    """G02: three slips just entered, names take 0.5 s; closing used to leave blank name cells and no audit rows."""
+    tmp, _ = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    for k in range(3):
+        inject(app, reader, readings[k], good(NAMES[k]), delay=0.5)
+    assert entered(app, 3) and all(j.state == "reading" for j in app.entries)
+    app.on_close()                                                    # what the window's X button does
+    assert [backend.row(FIRST_ROW + k)[0] for k in range(3)] == NAMES[:3]
+    rows = (tmp / "scans" / "log.csv").read_text(encoding="utf-8-sig").splitlines()
+    assert len(rows) == 4 and all(",ok," in r for r in rows[1:])      # header + 3 rows
+    assert len(list((tmp / "scans").glob("*/*.jpg"))) == 3
+    assert "closed-before-name" not in (tmp / "scanner.log").read_text()
+
+
+def test_closing_gives_up_on_names_that_never_arrive_with_a_question_mark_and_an_audit_row(env, mk, readings, monkeypatch):
+    tmp, _ = env
+    monkeypatch.setattr(gui, "CLOSE_WAIT_S", 0.4)
+    reader, gate = ScriptedReader(), threading.Event()
+    app, backend = mk(reader=reader)
+    inject(app, reader, readings[0], good("ANA"), gate=gate)
+    inject(app, reader, readings[1], good("BETO"), gate=gate)
+    assert entered(app, 2)
+    jobs = list(app.entries)
+    t0 = time.perf_counter()
+    app.on_close()
+    assert 0.3 < time.perf_counter() - t0 < 5
+    assert [backend.row(FIRST_ROW + k)[0] for k in range(2)] == ["?", "?"]
+    assert [j.state for j in jobs] == ["review", "review"] and "closed" in jobs[0].reason
+    rows = (tmp / "scans" / "log.csv").read_text(encoding="utf-8-sig").splitlines()
+    assert len(rows) == 3 and all(",review," in r for r in rows[1:])
+    log = (tmp / "scanner.log").read_text()
+    assert log.count("status=review") == 2 and "closed-before-name" not in log
+    gate.set()
+
+
+def test_closing_with_a_card_or_waiting_slips_asks_first(env, mk, readings, flagged, monkeypatch):
+    tmp, _ = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, flagged, good("ANA"))
+    assert pump(app, lambda: app.pending is not None)
+    inject(app, reader, readings[1], good("BETO"))
+    assert pump(app, lambda: len(app.backlog) == 1)
+    asked = []
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: asked.append(a[1]) or False)
+    app.on_close()                                                    # "No": the window stays, nothing is lost
+    assert asked and "2 slip(s) are NOT in Excel" in asked[0]
+    assert app.winfo_exists() and app.pending is not None and len(app.backlog) == 1 and not app.closing
+    app.on_close()
+    assert len(asked) == 2                                            # (it asks again, it did not stay "closing")
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: True)
+    app.on_close()                                                    # "Yes": closes, and says what was dropped
+    assert app.closing
+    assert "CLOSE_DROPPED  card=1 backlog=1" in (tmp / "scanner.log").read_text()
+
+
+# ======================================================================================= review round 2: the tick and the ghost row
+def test_a_failing_preview_does_not_starve_the_name_timeouts_or_eat_the_memory(env, mk, readings):
+    """G06: render_preview raising on every tick used to stop check_jobs, and every exception kept its traceback (and
+    the 6 MB camera frame) alive in callback_errors."""
+    reader, gate = ScriptedReader(), threading.Event()
+    app, backend = mk(reader=reader, name_timeout_s=0.3)
+    inject(app, reader, readings[0], good("ANA"), gate=gate)
+    assert entered(app, 1)
+
+    def broken(now):
+        raise ValueError("draw error " * 20)
+    app.render_preview = broken
+    assert named(app, app.entries[0])                                 # the time-out still fires
+    assert app.entries[0].state == "review" and row_of(backend, 0)[0] == "?"
+    pump(app, lambda: False, 1.5)
+    assert app.callback_error_count > 50 and len(app.callback_errors) == 50
+    assert all(isinstance(e, str) and len(e) <= 200 for e in app.callback_errors)
+    assert "INTERNAL ERROR - ValueError" in app.alert_var.get()       # the first occurrence is visible
+    gate.set()
+    app.callback_errors.clear()
+
+
+def test_an_error_after_the_excel_write_still_asks_for_the_name(env, mk, readings):
+    """G07: refresh_blocks raising right after the write used to leave a row with no name request, for ever."""
+    tmp, _ = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+
+    def boom(select_default=False):
+        raise RuntimeError("tree broke")
+    app.refresh_blocks = boom
+    inject(app, reader, readings[0], good("ANA"))
+    assert entered(app, 1) and named(app, app.entries[0])
+    assert app.entries[0].state == "ok" and row_of(backend, 0) == ["ANA"] + STACK[0][0]
+    assert not app.pending and not app.callback_errors                # logged, not raised: the slip is entered
+    app.flush_io()
+    assert "UI_ERROR" in (tmp / "scanner.log").read_text()
+
+
+def test_a_row_that_never_got_a_name_request_is_flagged_instead_of_waiting_for_ever(env, mk, readings, monkeypatch):
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader, name_timeout_s=0.4)
+    monkeypatch.setattr(app.pool, "submit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("shut down")))
+    inject(app, reader, readings[0], good("ANA"))
+    assert entered(app, 1)
+    job = app.entries[0]
+    assert job.future is None and job.t_submit > 0
+    assert named(app, job)
+    assert job.state == "review" and "never started" in job.reason and row_of(backend, 0)[0] == "?"
+
+
+# ======================================================================================= review round 2: crops of failing names
+def test_the_name_picture_of_a_row_still_being_read_survives_20_newer_entries(env, mk, readings):
+    """G08: the picture of entry #1 was dropped after 20 newer entries, so its late failure became a red row without
+    anything to read the name from. Review pictures are kept as JPEG (G09), not as 190 KB arrays."""
+    reader, gate = ScriptedReader(), threading.Event()
+    app, backend = mk(reader=reader)
+    inject(app, reader, readings[0], NameResult(error="Claude took too long", systemic=False), gate=gate)
+    for _ in range(22):
+        inject(app, reader, readings[1], good("ANA"))
+    assert pump(app, lambda: len(app.entries) == 23, 30) and named(app, *app.entries[1:])
+    job = app.entries[0]
+    assert job.state == "reading" and job.name_crop is not None
+    gate.set()
+    assert named(app, job) and job.state == "review"
+    assert job.name_crop is None and isinstance(job.crop_jpg, bytes) and len(job.crop_jpg) < 40_000
+    assert job.crop().shape[1] == 640                                   # (the kept copy is shrunk to 640 px)
+    app.select_next_review()
+    assert app.rev_job is job and str(app.rev_img.cget("image")) != ""
+    assert app.entries[1].name_crop is None and app.entries[1].crop_jpg is None       # ok rows drop theirs
+
+
+# ======================================================================================= review round 2: the name reader is down
+def systemic(msg="Anthropic API key rejected"):
+    return NameResult(error=msg, systemic=True)
+
+
+def test_a_name_reader_that_is_down_raises_one_alert_and_switches_to_the_card(env, mk, readings):
+    """SOAK-3 / G09: revoked key, no credit, no internet ...: three service failures in a row = ONE clear alert, Auto-enter
+    off (the operator types names on the card), no beep per slip; the first read that works again clears it."""
+    tmp, beeps = env
+    reader = ScriptedReader()
+    gates = [threading.Event() for _ in range(5)]
+    app, backend = mk(reader=reader, name_workers=6)
+    for k in range(5):
+        inject(app, reader, readings[k], systemic(), gate=gates[k])   # five slips go in, their names are all in flight
+    assert entered(app, 5)
+    a0 = beeps["attention"]
+    for k in range(5):
+        gates[k].set()
+        assert named(app, app.entries[k])
+    assert [row_of(backend, k)[0] for k in range(5)] == ["?"] * 5
+    assert app._rd_down and app.auto_var.get() is False and app.breaker
+    assert "NAME READING IS NOT WORKING (Anthropic API key rejected)" in app.alert_var.get()
+    assert beeps["attention"] - a0 == 3                               # 2 rows + the alert; never one per slip
+    assert "NAME READER DOWN" in app.stats_var.get()
+    inject(app, reader, readings[5], good("PACO"))                    # from now on: the classic card, name read for it
+    assert pump(app, lambda: app.pending is not None) and len(app.entries) == 5
+    assert pump(app, lambda: not app._rd_down)                        # that read worked: the alert recovers by itself
+    assert app.auto_var.get() is True and "NOT WORKING" not in app.alert_var.get() and not app.breaker
+    assert app.name_var.get() == "PACO"
+    app.flush_io()
+    log = (tmp / "scanner.log").read_text()
+    assert "READER_DOWN" in log and "READER_OK" in log and log.count("READER_DOWN") == 1
+
+
+def test_a_failure_about_one_slip_is_not_a_reader_outage(env, mk, readings):
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    answers = [systemic("no internet"), systemic("no internet"), good("CARLOS"),             # a success resets the count
+               systemic("no internet"), NameResult(error="Claude declined to read this one"), systemic("no internet")]
+    for rd, a in zip(readings, answers):
+        inject(app, reader, rd, a, delay=0.02)
+        assert entered(app, len(app.entries) + 1) and named(app, app.entries[-1])
+    assert not app._rd_down and app.auto_var.get() is True and "NOT WORKING" not in app.alert_var.get()
+
+
+def test_requests_that_stay_silent_raise_the_alert_before_their_timeouts(env, mk, readings, monkeypatch):
+    """SOAK-3 (black-holed API): three requests silent for a while and nothing answered = the reader is down."""
+    monkeypatch.setattr(gui, "READER_HANG_S", 0.2)
+    reader, gate = ScriptedReader(), threading.Event()
+    app, backend = mk(reader=reader, name_workers=6, name_timeout_s=8.0)         # (silent for 4 s = half the time-out)
+    for k in range(3):
+        inject(app, reader, readings[k], good("X"), gate=gate)
+    assert entered(app, 3)
+    assert pump(app, lambda: app._rd_down, 6)
+    assert all(j.state == "reading" for j in app.entries)             # (raised long before any time-out)
+    assert "Claude is not answering" in app.alert_var.get() and app.auto_var.get() is False
+    gate.set()
+
+
+@pytest.mark.parametrize("exc,systemic_flag", [
+    (FakeAnthropic.APITimeoutError("t"), True), (FakeAnthropic.APIConnectionError("c"), True),
+    (FakeAnthropic.AuthenticationError("a"), True), (FakeAnthropic.RateLimitError("r"), True),
+    (FakeAnthropic.APIStatusError("s"), True), (FakeAnthropic.APIError("e"), True),
+    (RuntimeError("anything else"), False)])
+def test_name_reader_marks_service_failures_as_systemic(exc, systemic_flag):
+    def create(**kw):
+        raise exc
+    res = fake_reader(create).read(np.zeros((100, 400, 3), np.uint8))
+    assert res.error and res.systemic is systemic_flag
+
+
+def test_slip_specific_reader_failures_are_not_systemic():
+    assert fake_reader(lambda **kw: _Resp("", stop="refusal")).read(np.zeros((10, 40, 3), np.uint8)).systemic is False
+    assert fake_reader(lambda **kw: _Resp("", stop="max_tokens")).read(np.zeros((10, 40, 3), np.uint8)).systemic is False
+    assert fake_reader(lambda **kw: _Resp("no json")).read(np.zeros((10, 40, 3), np.uint8)).systemic is False
+    assert NameResult("A", "12", True).systemic is False
+
+
+# ======================================================================================= review round 2: buttons, keys, layout
+def test_capture_now_ignores_a_double_click_and_the_click_right_after_one(env, mk, readings, monkeypatch):
+    """G10: two quick clicks entered the same slip twice (three tickets in the review's test)."""
+    assert gui.CAPTURE_DEBOUNCE_S == 1.5
+    monkeypatch.setattr(gui, "CAPTURE_DEBOUNCE_S", 30.0)               # (so that a slow machine cannot outlast the window)
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    rd = copy.copy(readings[0])
+    rd.name_crop = rd.name_crop.copy()
+    reader.expect(rd.name_crop, good("ANA"))
+    calls = []
+
+    def fake(frame):
+        calls.append(time.perf_counter())
+        return Update(WAIT_REMOVE, "Captured.", reading=rd, timings={"read_ms": 150.0})
+    app.engine.capture_now = fake
+    assert pump(app, lambda: app._latest is not None)
+    for _ in range(3):
+        app.capture_now()
+    assert entered(app, 1)
+    settle(app, 0.4)
+    assert len(calls) == 1 and len(app.entries) == 1
+    app.capture_now()                                                 # still inside the debounce window
+    settle(app, 0.3)
+    assert len(calls) == 1
+    app._capture_not_before = 0.0                                     # ... and once it has passed, the button works again
+    app.capture_now()
+    assert entered(app, 2) and len(calls) == 2
+
+
+def test_capture_now_while_a_card_is_open_says_so(env, mk, flagged):
+    app, backend = mk(reader=ScriptedReader())
+    calls = []
+    app.engine.capture_now = lambda frame: calls.append(1)
+    inject(app, None, flagged)
+    assert pump(app, lambda: app.pending is not None and app._latest is not None)
+    app.capture_now()
+    settle(app, 0.2)
+    assert not calls and "Finish the slip on the card first" in app.status_var.get()
+
+
+@pytest.mark.parametrize("sw,sh,scale", [(1366, 768, 1.0), (1280, 720, 1.0), (1920, 1080, 1.5)])
+def test_the_window_fits_a_small_screen_and_history_stays_reachable(env, mk, monkeypatch, sw, sh, scale):
+    """G11: minsize 780 tall on a 768 px screen put the history list, 'Undo last' and 'Next to review' off screen."""
+    monkeypatch.setattr(gui.App, "_screen", lambda self: (sw, sh, scale))
+    app, backend = mk()
+    app.alert("one more alert line: the strip must not push the history off screen", "excel", beep=False)
+    settle(app, 0.4)
+    W, H = app.winfo_width(), app.winfo_height()
+    assert app.compact and W <= sw - 20 and H <= sh - int(90 * scale), (W, H)
+    top = app.winfo_rooty()
+    for name in ("tree", "undo_btn", "review_btn", "stats_lbl"):
+        w = getattr(app, name)
+        assert w.winfo_viewable() and w.winfo_rooty() - top + w.winfo_height() <= H, name
+        assert w.winfo_rootx() - app.winfo_rootx() + w.winfo_width() <= W, name
+    if app._main.winfo_reqheight() > app._mid_canvas.winfo_height():          # squeezed: the middle scrolls instead
+        assert app._mid_sb.winfo_ismapped()
+
+
+def test_a_roomy_screen_keeps_the_normal_layout(env, mk, monkeypatch):
+    monkeypatch.setattr(gui.App, "_screen", lambda self: (1920, 1080, 1.0))
+    app, backend = mk()
+    settle(app, 0.2)
+    assert not app.compact and app.preview_w == gui.PREVIEW_W and not app._mid_sb.winfo_ismapped()
+
+
+def key_to(app, widget, key):
+    widget.focus_force()
+    settle(app, 0.05)
+    widget.event_generate(key)
+    settle(app, 0.05)
+
+
+def test_enter_and_escape_in_an_entry_never_act_on_the_card(env, mk, readings, flagged):
+    """G16: Esc in the 'Save name' entry discarded the open card; Enter in the tag / ticket entry wrote it."""
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, readings[0], NameResult(error="no internet"))
+    assert entered(app, 1) and named(app, app.entries[0])
+    inject(app, reader, flagged, good("ANA"))
+    assert pump(app, lambda: app.pending is not None and app.name_var.get() == "ANA")
+    for entry in (app.tag_entry, app.ticket_entry):
+        key_to(app, entry, "<Return>")
+        key_to(app, entry, "<Escape>")
+        assert app.pending is not None and len(app.entries) == 1, entry
+    app.select_next_review()
+    key_to(app, app.rev_entry, "<Escape>")
+    assert app.pending is not None and app.rev_job is app.entries[0]
+    key_to(app, app.rev_entry, "<Return>")                            # (saves the name, never writes the card)
+    assert app.pending is not None and len(app.entries) == 1
+    fix_flagged_card(app)
+    key_to(app, app.name_entry, "<Return>")                           # the card's own name entry still writes it
+    assert app.pending is None and len(app.entries) == 2 and row_of(backend, 1)[0] == "ANA"
+
+
+def test_escape_in_the_name_entry_of_the_card_still_discards_it(env, mk, flagged):
+    app, backend = mk(reader=None)
+    inject(app, None, flagged)
+    assert pump(app, lambda: app.pending is not None)
+    key_to(app, app.name_entry, "<Escape>")
+    assert app.pending is None
+
+
+def test_f2_in_the_ticket_box_toggles_the_tag_but_is_not_a_ticket_edit(env, mk):
+    """G16: any key typed in the Ticket entry (even F2) made the ticket 'custom'; only a real edit does."""
+    app, backend = mk()
+    assert app.ticket_custom is False and app.ticket_var.get() == "251"
+    key_to(app, app.ticket_entry, "<F2>")
+    key_to(app, app.ticket_entry, "<Shift_L>")
+    key_to(app, app.ticket_entry, "<Left>")
+    assert app.tag_on.get() is True and app.ticket_custom is False
+    app.ticket_entry.insert("end", "0")                               # typing / pasting / cutting: a real edit
+    assert app.ticket_custom is True and app.ticket_var.get() == "2510"
+    app.select_info(app.selected_info())                              # picking a block starts from the suggestion again
+    assert app.ticket_custom is False and app.ticket_var.get() == "251"
+
+
+def test_a_row_that_could_not_be_read_cannot_be_written_as_f1_by_accident(env, mk, flagged, monkeypatch):
+    """G16: Enter with a double mark left on 'empty' wrote the same F1 as a genuinely empty box."""
+    app, backend = mk(reader=None)
+    asked = []
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *a, **k: asked.append(a[1]) or False)
+    inject(app, None, flagged)
+    assert pump(app, lambda: app.pending is not None)
+    app.name_var.set("ANA")
+    app.commit()                                                      # row 3 (two marks) was never resolved
+    assert asked and "Row 3" in asked[0] and app.pending is not None and row_of(backend, 0) == [None] * 10
+    app.pick_vars[2].set("V")
+    app.pick_edited(2)
+    app.commit()                                                      # resolved by the operator: no question
+    assert len(asked) == 1 and row_of(backend, 0)[3] == "V" and row_of(backend, 0)[2] == "F1"   # (row 2 was blank: F1)
+
+
+def test_the_jornada_guard_shows_whether_it_is_on(env, mk):
+    """G17: 'JORNADA_10.xlsx' / 'Quiniela J10.xlsx' silently switched the wrong-jornada guard off."""
+    for name, expect in [("JORNADA 10 PC.xlsx", "10"), ("Jornada10.xlsx", "10"), ("JORNADA_10.xlsx", "10"),
+                         ("JORNADA-10.xlsx", "10"), ("JORNADA No. 10.xlsx", "10"), ("JORNADA #10 PC.xlsx", "10"),
+                         ("JORNADA 12 (copia 2).xlsx", "12"), ("Quiniela J10.xlsx", ""), ("pool.xlsx", "")]:
+        assert gui.jornada_of(name) == expect, name
+    for wbname, cfgkw, text, colour in [("JORNADA_11 PC.xlsx", {}, "Jornada check: 11", gui.GOOD),
+                                        ("Quiniela J10.xlsx", {}, "OFF", gui.WARN),
+                                        ("Quiniela J10.xlsx", {"expected_jornada": "10"}, "Jornada check: 10", gui.GOOD)]:
+        app, backend = mk(wbname=wbname, **cfgkw)                     # (one window at a time: images belong to the first Tk)
+        assert text in app.jornada_var.get() and str(app.jornada_lbl.cget("foreground")) == colour, wbname
+        app.destroy()
+
+
+# ======================================================================================= review round 2: the repeats the engine drops
+def test_dropped_repeats_are_counted_logged_and_the_message_stays(env, mk, readings):
+    """E5: the engine drops a re-read of the entered slip; nothing showed it, and the status line went back to 'Entered'."""
+    tmp, _ = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    app._stop_camera()                                                # (an idle camera would clear the 'entered' message)
+    with app._lock:
+        app._latest = None                                            # (and no camera frame may be drawn over the events)
+    inject(app, reader, readings[0], good("ANA"))
+    assert entered(app, 1)
+    msg = "Same slip still there - lift it off."
+    for _ in range(2):
+        app.events.put(("scan", Update(WAIT_REMOVE, msg, duplicate=True), time.perf_counter()))
+    assert pump(app, lambda: app.dupes_skipped == 2)
+    assert "Skipped repeats: 2" in app.stats_var.get() and app.status_var.get() == msg and len(app.entries) == 1
+    app.flush_io()
+    assert (tmp / "scanner.log").read_text().count("DUPLICATE_SKIPPED") == 2
+    frame = np.full((1080, 1920, 3), 200, np.uint8)                   # the engine goes on saying it while the slip stays
+    with app._lock:
+        app._latest = (50_000, frame, Update(WAIT_REMOVE, msg))
+    app._next_preview = 0.0
+    assert app._entered_msg
+    app.render_preview(time.perf_counter())
+    assert app.status_var.get() == msg                                # (not overwritten by 'Entered ticket 251 ...')
+    with app._lock:
+        app._latest = (50_001, frame, Update("idle", "Place a slip flat under the camera."))
+    app.render_preview(time.perf_counter() + 1)
+    assert app.status_var.get().startswith("Place a slip") and not app._dup_latched and not app._entered_msg
+
+
+def test_the_camera_loop_hands_dropped_repeats_to_the_window(env, mk):
+    app, backend = mk()
+    sent = []
+    app.engine.feed = lambda frame: (sent.append(1) or Update(WAIT_REMOVE, "Same slip still there - lift it off.",
+                                                              duplicate=True)) if not sent else Update("idle", "")
+    assert pump(app, lambda: app.dupes_skipped == 1, 5)
+
+
+def test_undoing_an_entry_stops_the_status_bar_from_claiming_it_is_entered(env, mk, readings):
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    app._stop_camera()                                                # (an idle camera would clear the message by itself)
+    inject(app, reader, readings[0], good("ANA"))
+    assert entered(app, 1) and app._entered_msg
+    app.undo()
+    assert app._entered_msg == ""
+
+
+# ======================================================================================= review round 2: start-up and exit
+def test_the_window_opens_even_when_excel_connection_fails_in_an_unexpected_way(env, monkeypatch):
+    """F3 (GUI part): connect_excel only caught ExcelError, so e.g. ActiveWorkbook = Nothing crashed App()."""
+    def boom(*a, **k):
+        raise AttributeError("'NoneType' object has no attribute 'Name'")
+    monkeypatch.setattr(gui, "open_backend", boom)
+    cfg = Config()
+    cfg.read_names_with_claude = False
+    app = gui.App(cfg, source=NullSource())
+    try:
+        assert app.sink is None and "NOT CONNECTED" in app.excel_var.get() and "AttributeError" in app.excel_var.get()
+        assert str(app.excel_lbl.cget("foreground")) == gui.BAD and not app.jornada_var.get()
+    finally:
+        app.destroy()
+
+
+def test_problems_with_config_files_are_shown_at_start_up(env):
+    xlsx = make_pool_workbook(env[0] / "JORNADA 12 PC.xlsx")
+    cfg = Config()
+    cfg.read_names_with_claude = False
+    cfg.notes = ["config.json could not be read (ValueError: x) - using the default settings. Your file was kept as "
+                 "config.json.bak."]
+    app = gui.App(cfg, source=NullSource(), backend=MemBackend(str(xlsx)))
+    try:
+        assert "kept as config.json.bak" in app.alert_var.get() and app.alert_frame.winfo_manager() == "pack"
+    finally:
+        app.destroy()
+
+
+def run_and_close(env, monkeypatch, with_hung_request):
+    """gui.run() with the real main loop; the window is closed 0.3 s after start. Returns what os._exit was called with."""
+    tmp, _ = env
+    exits = []
+    monkeypatch.setattr(gui.os, "_exit", lambda code: exits.append(code))
+    monkeypatch.setattr(gui, "CLOSE_WAIT_S", 0.2)
+    reader, gate = ScriptedReader(), threading.Event()
+    rd = read_of(STACK[0][0], "ANA", 1)
+    orig = gui.App.__init__
+
+    def patched(self, cfg, source=None, backend=None):
+        orig(self, cfg, source, backend)
+        if with_hung_request:
+            self.reader = reader
+            inject(self, reader, rd, good("ANA"), gate=gate)
+        self.after(300, self.on_close)
+    monkeypatch.setattr(gui.App, "__init__", patched)
+    cfg = Config()
+    cfg.read_names_with_claude = False
+    backend = MemBackend(str(make_pool_workbook(tmp / "JORNADA 12 PC.xlsx")))
+    try:
+        gui.run(cfg, NullSource(), backend)
+    finally:
+        gate.set()
+    return exits
+
+
+def test_the_process_does_not_wait_for_a_hung_name_request_after_the_window_closes(env, monkeypatch):
+    """SOAK-9 / G14: only jobs still 'reading' were guarded, but a request the app already gave up on (or one for the
+    classic card) keeps its non-daemon pool thread - and so the process - alive for up to a minute."""
+    assert run_and_close(env, monkeypatch, with_hung_request=True) == [0]
+
+
+def test_a_clean_exit_is_left_alone(env, monkeypatch):
+    assert run_and_close(env, monkeypatch, with_hung_request=False) == []
+
+
+# ======================================================================================= review round 2: files the user edits
+PS_JSON = {"config_version": CONFIG_VERSION, "workbook": "JORNADA 10 Ñandú", "camera_index": 1, "name_tag": "RRR",
+           "sheets": ["ENTRY*", "PG2"], "auto_enter": False}
+
+
+@pytest.mark.parametrize("label,encode", [
+    ("utf-8", lambda t: t.encode("utf-8")), ("utf-8 + BOM", lambda t: b"\xef\xbb\xbf" + t.encode("utf-8")),
+    ("utf-16 + BOM (PowerShell > )", lambda t: t.encode("utf-16")), ("utf-16 BE + BOM", lambda t: b"\xfe\xff" + t.encode("utf-16-be")),
+    ("utf-16 LE no BOM", lambda t: t.encode("utf-16-le")), ("ANSI code page", lambda t: t.encode("cp1252"))])
+def test_config_json_is_read_in_any_encoding_a_windows_editor_may_use(tmp_path, label, encode):
+    """G13: a config.json with a BOM or in UTF-16 loaded as all defaults and was then overwritten on close."""
+    path = tmp_path / "config.json"
+    path.write_bytes(encode(json.dumps(PS_JSON, ensure_ascii=False)))
+    cfg = Config.load(path)
+    assert (cfg.workbook, cfg.camera_index, cfg.name_tag, cfg.sheets, cfg.auto_enter) == \
+        ("JORNADA 10 Ñandú", 1, "RRR", ["ENTRY*", "PG2"], False), label
+    assert cfg.notes == [] and not list(tmp_path.glob("*.bak*"))
+
+
+def test_an_unreadable_config_json_is_kept_as_a_bak_and_the_user_is_told(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text("{ camera_index: 1,  // my settings", encoding="utf-8")
+    cfg = Config.load(path)
+    assert asdict(cfg) == asdict(Config()) and len(cfg.notes) == 1 and "kept as config.json.bak" in cfg.notes[0]
+    cfg.save(path)                                                    # what the next close does ...
+    assert json.loads(path.read_text()) == {"config_version": CONFIG_VERSION}
+    assert (tmp_path / "config.json.bak").read_text(encoding="utf-8") == "{ camera_index: 1,  // my settings"   # ... is harmless
+    path.write_text("[1, 2]")
+    assert "config.json.bak2" in Config.load(path).notes[0]           # an earlier .bak is never overwritten
+    assert (tmp_path / "config.json.bak").read_text(encoding="utf-8").startswith("{ camera_index")
+    path.write_text("")
+    cfg = Config.load(path)
+    assert cfg.notes and "kept as" not in cfg.notes[0] and not (tmp_path / "config.json.bak3").exists()
+
+
+def test_values_that_would_break_the_app_fall_back_to_the_default_with_a_note(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text('{"config_version": 2, "matches_per_slip": 0, "name_timeout_s": NaN, "camera_index": -3, '
+                    '"frame_width": 0, "sheets": [1, 2], "backend": "excel", "name_workers": 9000, "name_tag": "OK"}')
+    cfg = Config.load(path)
+    d = Config()
+    assert (cfg.matches_per_slip, cfg.name_timeout_s, cfg.camera_index, cfg.frame_width, cfg.sheets, cfg.backend,
+            cfg.name_workers) == (d.matches_per_slip, d.name_timeout_s, d.camera_index, d.frame_width, d.sheets,
+                                  d.backend, d.name_workers)
+    assert cfg.name_tag == "OK" and len(cfg.notes) == 7
+    assert any("matches_per_slip=0" in n for n in cfg.notes) and any("sheets=[1, 2]" in n for n in cfg.notes)
+
+
+@pytest.mark.parametrize("label,raw", [
+    ("utf-8", b"ANTHROPIC_API_KEY=sk-ant-test\r\n"), ("utf-8 + BOM", b"\xef\xbb\xbfANTHROPIC_API_KEY=sk-ant-test\r\n"),
+    ("utf-16 + BOM (PowerShell > )", "ANTHROPIC_API_KEY=sk-ant-test\r\n".encode("utf-16")),
+    ("ANSI with an accent in a comment", "# clave de Mirándola\r\nANTHROPIC_API_KEY=\"sk-ant-test\"\r\n".encode("cp1252"))])
+def test_dotenv_is_read_in_any_encoding(tmp_path, monkeypatch, label, raw):
+    """G12: UTF-16 and ANSI crashed start-up, a BOM silently hid the key."""
+    monkeypatch.setattr(config_mod, "app_dir", lambda: tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")                       # (restored afterwards; empty counts as not set)
+    (tmp_path / ".env").write_bytes(raw)
+    assert config_mod.load_dotenv() == "" and os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test", label
+    assert config_mod.anthropic_key_present()
+
+
+def test_an_unreadable_dotenv_never_crashes_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_mod, "app_dir", lambda: tmp_path)
+    (tmp_path / ".env").mkdir()                                       # cannot be read as a file
+    assert ".env could not be read" in config_mod.load_dotenv()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "already-set")
+    (tmp_path / ".env").rmdir()
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=other")
+    config_mod.load_dotenv()
+    assert os.environ["ANTHROPIC_API_KEY"] == "already-set"           # the environment still wins
+
+
+# ======================================================================================= review round 2: audit failures
+def audit_reading(readings):
+    from quiniela_scanner.audit import AuditLog
+    return AuditLog, readings[0]
+
+
+def test_a_locked_log_csv_falls_back_to_a_second_file_and_reports_it(tmp_path, readings):
+    """G15: PermissionError on log.csv (Excel has it open) used to drop the audit row without a word."""
+    AuditLog, rd = audit_reading(readings)
+    log = AuditLog(tmp_path / "scans")
+    log.record(rd, rd.picks, "ANA", "wb.xlsx", "ENTRY PG1", 15, 251, "ok")
+    assert log.last_error == "" and (tmp_path / "scans" / "log.csv").exists()
+    csv_path = tmp_path / "scans" / "log.csv"
+    csv_path.unlink()
+    csv_path.mkdir()                                                  # cannot be opened for appending (a directory)
+    img = log.record(rd, rd.picks, "BETO Ñ", "wb.xlsx", "ENTRY PG1", 16, 252, "ok")
+    assert img and "log.csv cannot be written" in log.last_error and "log-" in log.last_error
+    fallback = next((tmp_path / "scans").glob("log-*.csv"))
+    assert fallback.read_bytes().startswith(b"\xef\xbb\xbf")          # BOM: Excel shows the Ñ right
+    assert "BETO Ñ" in fallback.read_text(encoding="utf-8-sig")
+    log.record(rd, rd.picks, "CARLOS", "wb.xlsx", "ENTRY PG1", 17, 253, "ok")
+    assert "CARLOS" in fallback.read_text(encoding="utf-8-sig") and log.last_error == ""   # (stays on the fallback)
+
+
+def test_an_unwritable_picture_folder_is_an_error_not_a_silent_empty_path(tmp_path, readings):
+    AuditLog, rd = audit_reading(readings)
+    (tmp_path / "scans").write_text("a file where the folder should be")
+    log = AuditLog(tmp_path / "scans")
+    assert log.record(rd, rd.picks, "ANA", "wb.xlsx", "S", 15, 251, "ok") == ""
+    assert "not saved" in log.last_error
+
+
+def test_low_disk_space_is_reported(tmp_path, readings, monkeypatch):
+    AuditLog, rd = audit_reading(readings)
+    monkeypatch.setattr("quiniela_scanner.audit.shutil.disk_usage",
+                        lambda p: type("U", (), {"free": 200_000_000, "total": 10**12, "used": 0})())
+    log = AuditLog(tmp_path / "scans")
+    log.record(rd, rd.picks, "ANA", "wb.xlsx", "S", 15, 251, "ok")
+    assert "only 200 MB free" in log.last_error
+
+
+def test_an_audit_failure_reaches_scanner_log_and_the_operator(env, mk, readings):
+    tmp, _ = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    (tmp / "scans").mkdir(exist_ok=True)
+    (tmp / "scans" / "log.csv").mkdir()                               # log.csv cannot be appended to
+    inject(app, reader, readings[0], good("ANA"))
+    assert entered(app, 1) and named(app, app.entries[0])
+    app.flush_io()
+    assert pump(app, lambda: "AUDIT LOG PROBLEM" in app.alert_var.get())
+    assert "log.csv cannot be written" in app.alert_var.get()
+    assert "AUDIT_ERROR" in (tmp / "scanner.log").read_text()
+    assert list((tmp / "scans").glob("log-*.csv")) and row_of(backend, 0)[0] == "ANA"        # nothing lost, Excel unaffected
+
+
+# ======================================================================================= review round 2: the command line
+def test_scan_out_writes_the_name_picture_next_to_the_image(tmp_path, monkeypatch, capsys):
+    """G18: '--out ./r.jpg' wrote the name crop to '_name./r.jpg' (a missing folder) and still said 'wrote'."""
+    from quiniela_scanner.__main__ import main
+    monkeypatch.setattr(config_mod, "app_dir", lambda: tmp_path)
+    photo = tmp_path / "slip.jpg"
+    cv2.imwrite(str(photo), on_webcam_canvas(draw_slip_named(STACK[0][0], "ANA", seed=1), scale=0.5, angle=4))
+    for sub, out_name in [("", "r.jpg"), ("dir.x", "r.jpg"), ("", "plain")]:
+        folder = tmp_path / sub if sub else tmp_path
+        folder.mkdir(exist_ok=True)
+        out = folder / out_name
+        assert main(["scan", str(photo), "--out", str(out)]) == 0
+        name_out = folder / ("r_name.jpg" if out_name == "r.jpg" else "plain_name.png")
+        assert out.exists() and name_out.exists(), (sub, out_name, list(folder.iterdir()))
+        assert cv2.imread(str(name_out)) is not None
+        assert not (tmp_path / "_name.").exists()
+    assert main(["scan", str(photo), "--out", str(tmp_path / "missing" / "r.jpg")]) == 2          # no more "wrote ..." for nothing
+    assert "cannot write" in capsys.readouterr().out
+
+
+def test_cli_tells_about_a_bad_config_json_on_stderr(tmp_path, monkeypatch, capsys):
+    from quiniela_scanner.__main__ import main
+    monkeypatch.setattr(config_mod, "app_dir", lambda: tmp_path)
+    (tmp_path / "config.json").write_text("{ nope")
+    photo = tmp_path / "slip.jpg"
+    cv2.imwrite(str(photo), on_webcam_canvas(draw_slip_named(STACK[0][0], "ANA", seed=1), scale=0.5, angle=4))
+    assert main(["scan", str(photo)]) == 0
+    assert "config.json could not be read" in capsys.readouterr().err
+
+
+# ======================================================================================= review round 2: a slow name pool
+def test_names_that_queue_for_a_free_reader_say_so_in_the_strip(env, mk, readings):
+    """SOAK-7 (cheap part): the only cue used to be 'names being read: N'."""
+    reader, gate = ScriptedReader(), threading.Event()
+    app, backend = mk(reader=reader, name_workers=1, name_timeout_s=60)
+    inject(app, reader, readings[0], good("ANA"), gate=gate)          # the only worker hangs on this one
+    inject(app, reader, readings[1], good("BETO"))                    # ... so this one waits for a reader
+    assert entered(app, 2)
+    waiting = app.entries[1]
+    assert waiting.t_started == 0 and "queueing" not in app.stats_var.get()
+    waiting.t_submit -= 11                                            # it has been waiting for 11 s
+    app.check_jobs(time.perf_counter())
+    assert "names are queueing: Claude is slower than the stack - raise name_workers" in app.stats_var.get()
+    gate.set()
+    assert named(app, *app.entries)
+    app.check_jobs(time.perf_counter())
+    assert "queueing" not in app.stats_var.get()
+
+
+def test_a_queued_name_is_not_failed_while_the_pool_is_making_progress(env, mk, readings):
+    """SOAK-7: a slow-but-healthy API must not turn queued names into '?' just because they waited 4 time-outs."""
+    reader, gate = ScriptedReader(), threading.Event()
+    app, backend = mk(reader=reader, name_workers=1, name_timeout_s=30)
+    inject(app, reader, readings[0], good("ANA"), gate=gate)
+    inject(app, reader, readings[1], good("BETO"))
+    assert entered(app, 2)
+    queued = app.entries[1]
+    queued.t_submit -= 200                                            # waited far longer than 4 x name_timeout_s
+    now = time.perf_counter()
+    app._last_name_done = now - 5                                     # but a name came back 5 s ago: the pool is alive
+    app.check_jobs(now)
+    assert queued.state == "reading"
+    app._last_name_done = now - 100                                   # nothing for 100 s: every worker is stuck
+    app.check_jobs(now)
+    assert queued.state == "review" and "no free name reader" in queued.reason
+    gate.set()

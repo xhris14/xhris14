@@ -11,7 +11,7 @@ import pytest
 
 from quiniela_scanner import slip_vision as sv
 from quiniela_scanner.capture import IDLE, PAUSED, TRACKING, WAIT_REMOVE, CaptureEngine
-from helpers import Stage, draw_slip_named, draw_unreadable_form, on_webcam_canvas
+from helpers import Stage, VClock, draw_slip_named, draw_unreadable_form, on_webcam_canvas
 
 PICKS = list("LVLLELLVE")
 OTHER = list("EEELLVVLV")
@@ -51,12 +51,15 @@ def test_same_slip_rephotographed_is_the_same(ref, kw):
 
 
 @pytest.mark.parametrize("name", ["JUAN PEREZ", "MARIA", "LUIS G.", "ANA L.", "JOSE", "PEDRO M.", "CARLOS"])
-def test_identical_picks_and_marks_but_other_name_is_different(ref, name):
+def test_marks_identical_to_the_pixel_are_one_slip_whatever_the_handwriting_says(ref, name):
+    """E1: a hand over the name strip changes the handwriting score alone (measured on a real photo: marks 1.00,
+    name 0.28), so marks that match as well as one slip's own two photos decide on their own. Two hand-drawn
+    slips never match like that (real ones peak at ~0.76, see the jitter tests below)."""
     # draw_slip's default rng gives both slips the very same mark jitter: only the handwriting differs
     other = _fp(draw_slip_named(PICKS, name, seed=7), angle=-3, seed=2)
     marks, name_score = sv.slip_similarity(ref, other)
-    assert marks > 0.95                                         # the marks really are identical ...
-    assert name_score < sv.NAME_SAME and not sv.same_slip(ref, other)   # ... the handwriting is not
+    assert marks > sv.MARKS_STRONG                              # the marks really are identical ...
+    assert name_score < sv.NAME_SAME and sv.same_slip(ref, other)   # ... the handwriting is not, and it does not matter
 
 
 @pytest.mark.parametrize("seed", range(20, 32))
@@ -100,8 +103,10 @@ def test_blank_name_strip_is_not_enough_to_be_the_same_slip():
     for seed in (8, 9, 11, 12):                                 # same picks, other jitter: another slip
         other = _fp(draw_slip_named(PICKS, "", seed=seed), angle=-2, seed=seed)
         assert not sv.same_slip(blank, other)
-    named = _fp(draw_slip_named(PICKS, "ANA", seed=7), angle=2, seed=2)
+    named = _fp(draw_slip_named(PICKS, "ANA", seed=8), angle=2, seed=2)       # other marks and a name: another slip
     assert not sv.same_slip(blank, named) and not sv.same_slip(named, blank)
+    covered = _fp(draw_slip_named(PICKS, "ANA", seed=7), angle=2, seed=2)     # the very same marks, name hidden or not
+    assert sv.same_slip(blank, covered) and sv.same_slip(covered, blank)
     other_pick = list(PICKS)
     other_pick[3] = "V"
     assert not sv.same_slip(blank, _fp(draw_slip_named(other_pick, "", seed=7), angle=2, seed=2))
@@ -212,16 +217,25 @@ def _mutated(rd, seed, mark_shift=0, new_name=None):
                                          candidates=rd.candidates))
 
 
-@pytest.mark.parametrize("seed,shift,name", [(1, 0, "JUAN P."), (2, 0, "MARIA"), (3, 6, None), (4, 7, None),
-                                             (5, 6, "ELENA G."), (6, 8, "PACO")])
-def test_real_ink_with_other_handwriting_or_marks_is_a_different_slip(real, seed, shift, name):
+@pytest.mark.parametrize("seed,shift,name", [(3, 6, None), (4, 7, None), (5, 6, "ELENA G."), (6, 8, "PACO")])
+def test_real_ink_with_other_marks_is_a_different_slip(real, seed, shift, name):
     img, rd, fp = real
     assert not sv.same_slip(fp, _mutated(rd, seed, shift, name)), sv.slip_similarity(fp, _mutated(rd, seed, shift, name))
 
 
+@pytest.mark.parametrize("seed,name", [(1, "JUAN P."), (2, "MARIA")])
+def test_real_ink_with_only_the_name_changed_is_still_the_same_slip(real, seed, name):
+    """The hand-over-the-name case on the real ink: marks identical, handwriting wiped / replaced."""
+    img, rd, fp = real
+    other = _mutated(rd, seed, 0, name)
+    marks, name_score = sv.slip_similarity(fp, other)
+    assert marks > sv.MARKS_STRONG and (name_score is None or name_score < sv.NAME_SAME)
+    assert sv.same_slip(fp, other) and sv.same_slip(other, fp)
+
+
 # =============================================================================== the engine on a stack
-SPECS = [  # (picks, name, mark-jitter seed): identical picks with other names, one single-mark change, identical marks
-    (PICKS, "CLEMENTE O.", 1), (PICKS, "MARIA G.", 1), (PICKS[:3] + ["V"] + PICKS[4:], "CLEMENTE O.", 3),
+SPECS = [  # (picks, name, mark-jitter seed): identical picks with other names (the marks drawn anew each time), one single-mark change
+    (PICKS, "CLEMENTE O.", 1), (PICKS, "MARIA G.", 2), (PICKS[:3] + ["V"] + PICKS[4:], "CLEMENTE O.", 3),
     (PICKS, "LUIS PEREZ", 4), (OTHER, "ANA", 5), (OTHER, "JOSE M.", 6),
 ]
 
@@ -294,9 +308,13 @@ def test_reads_carry_timings(stack_run):
 
 
 def test_feed_stays_cheap_on_full_hd_frames(stack_run):
+    """Frames that read nothing (a read is ~190 ms, a re-check of the slip waiting for its lift ~90 ms, both reported)."""
     _, _, ev = stack_run
-    ms = [u.timings["feed_ms"] for _, _, u in ev if u.reading is None and not u.duplicate and not u.error]
-    assert np.mean(ms) < 40 and np.percentile(ms, 95) < 60, (np.mean(ms), np.percentile(ms, 95))
+    ms = [u.timings["feed_ms"] for _, _, u in ev if u.reading is None and not u.duplicate and not u.error
+          and "verify_ms" not in u.timings]
+    assert np.mean(ms) < 30 and np.percentile(ms, 95) < 60, (np.mean(ms), np.percentile(ms, 95))     # measured: ~6 ms, p95 ~20
+    checks = [u.timings["verify_ms"] for _, _, u in ev if "verify_ms" in u.timings]
+    assert len(checks) <= 2 * len(SPECS) and np.mean(checks) < 200, (len(checks), np.mean(checks))
 
 
 def test_hand_only_frames_are_never_read():
@@ -482,3 +500,162 @@ def test_a_fast_partial_lift_still_re_arms_the_engine():
     eng = CaptureEngine(9)
     got = [u.reading for u in map(eng.feed, frames) if u.reading is not None]
     assert [r.picks for r in got] == [list(p) for p, _, _ in specs]
+
+
+# =============================================================================== SOAK-4: slips missed at low frame rates / after a hand sweep
+# A lift that is too short for the camera, or that falls inside a read, leaves the next slip - lying in the same place -
+# looking like the last one to the frame differences (0.3-0.8% of the thumbnail against LO = 1%): it was never read, and
+# nothing said so. The engine now re-checks, while it waits for the lift, that the slip there is still the one it entered.
+FILM_SPECS = [(list("LVLLELLVE"), "CLEMENTE O.", 1), (list("EEELLVVLV"), "ANA", 5), (list("VVVLLLEEE"), "BETO", 6),
+              (list("LLLEEEVVV"), "CARLOS M.", 7), (list("LEVLEVLEV"), "DOLORES", 8), (list("VELVELVEL"), "PACO 2", 9),
+              (list("LLVVEELLV"), "JUAN G.", 10), (list("EVLEVLEVL"), "TONY 5000", 11), (list("ELVELVELV"), "RITA", 12),
+              (list("VLEVLEVLE"), "OMAR", 13)]
+
+
+class Film:
+    """A 30 fps film of a stack: every slip lies still ``hold`` frames (optionally a hand sweeps over it after it was read, and
+    rests ``hand_pause`` frames) and is then lifted in ``lift`` frames, revealing the next one."""
+
+    def __init__(self, n=10, lift=4, hold=30, hand_over=(), hand_pause=4, size=None, dim=0.0, noise=0.0, seed=2):
+        st = Stage(seed=seed)
+        ids = [st.add(draw_slip_named(p, nm, seed=s)) for p, nm, s in FILM_SPECS[:n]]
+        self.picks = [tuple(p) for p, _, _ in FILM_SPECS[:n]]
+        frames = [f for f, _ in st.empty(4)]
+        for k, i in enumerate(ids):
+            under = ids[k + 1] if k + 1 < len(ids) else None
+            bank = [f for f, _ in st.hold(i, 8, under=under)]
+            frames += [bank[j % 8] for j in range(hold)]
+            if k in hand_over:
+                frames += [f for f, _ in st.hand_pass(6, top=i, under=under)] + [bank[j % 8] for j in range(hand_pause)]
+            frames += [f for f, _ in st.lift(i, under, lift)]
+        frames += [f for f, _ in st.empty(10)]
+        rng = np.random.default_rng(3)
+        bank = None
+        self.frames = []
+        for f in frames:
+            if size:
+                f = cv2.resize(f, size, interpolation=cv2.INTER_AREA)
+            if dim:
+                f = cv2.convertScaleAbs(f, alpha=1 - dim)
+            if noise:
+                if bank is None:                              # a few noise fields, each frame takes a random crop of one
+                    bank = [np.rint(rng.normal(0, noise, (f.shape[0] + 32, f.shape[1] + 32, 3))).astype(np.int16) for _ in range(3)]
+                oy, ox = rng.integers(0, 32, 2)
+                f = np.clip(f.astype(np.int16) + bank[int(rng.integers(3))][oy:oy + f.shape[0], ox:ox + f.shape[1]], 0, 255).astype(np.uint8)
+            self.frames.append(f)
+
+
+def play(film, fps=30, read_s=0.19, verify_s=0.09, frame_s=0.02, **kw):
+    """A camera of ``fps`` frames per second (the film at 30 fps, every (30/fps)-th frame): the engine takes the newest frame
+    whenever it is free, a read stalls it for ``read_s`` and a re-check for ``verify_s`` (virtual time, so the outcome does not
+    depend on the machine). -> (readings, duplicates, errors, number of re-checks)."""
+    clock = VClock()
+    eng = CaptureEngine(9, clock=clock, **kw)
+    stride = 30.0 / fps
+    i, readings, dups, errs, checks = 0.0, [], 0, 0, 0
+    while int(round(i)) < len(film.frames):
+        idx = int(round(i))
+        clock.t = idx / 30.0
+        u = eng.feed(film.frames[idx])
+        cost = frame_s
+        if u.reading is not None or u.duplicate or u.error:
+            cost += read_s
+        if "verify_ms" in u.timings:
+            checks += 1
+            cost += verify_s
+        if u.reading is not None:
+            readings.append(tuple(u.reading.picks))
+        dups += u.duplicate
+        errs += bool(u.error)
+        i = max(idx + stride, np.floor((idx / 30.0 + cost) * 30.0 / stride) * stride)
+    return readings, dups, errs, checks
+
+
+def lost_and_repeated(film, readings):
+    lost = [k for k, p in enumerate(film.picks) if p not in readings]
+    repeated = [k for k, p in enumerate(film.picks) if readings.count(p) > 1]
+    stray = [r for r in readings if r not in film.picks]
+    return lost, repeated, stray
+
+
+@pytest.fixture(scope="module")
+def film():
+    return Film(n=8, lift=4, hold=30)
+
+
+@pytest.mark.parametrize("fps", [15, 10, 7.5])
+def test_every_slip_is_read_exactly_once_whatever_the_camera_speed(film, fps):
+    """Lifts of 4 frames (130 ms) at a camera of 15 / 10 / 7.5 fps: the old engine lost 0 / 7 of 12 / 6 of 12 slips here (6 and 29
+    of 60 in the full soak at 15 and 10 fps): the next slip, lying in the same place, never looked 'different' to it."""
+    readings, dups, errs, checks = play(film, fps)
+    lost, repeated, stray = lost_and_repeated(film, readings)
+    assert not lost and not repeated and not stray and not errs, (lost, repeated, stray, errs)
+    assert dups == 0                                          # and the re-checks raised no false alarm
+
+
+def test_without_the_re_check_the_slow_camera_loses_slips(film):
+    """The scenario is the hard one it claims to be: with verify=False (the old behaviour) slips go missing at 10 fps."""
+    readings, dups, errs, checks = play(film, 10, verify=False)
+    lost, repeated, stray = lost_and_repeated(film, readings)
+    assert len(lost) >= 2 and checks == 0 and not repeated
+
+
+def test_dim_light_at_15_fps():
+    """Gain 0.5 + noise 6 (the old engine lost 11 of 12 slips here, 22 of 60 in the soak: the lift hides in the noise)."""
+    f = Film(n=5, lift=4, hold=30, dim=0.5, noise=6)
+    lost, repeated, stray = lost_and_repeated(f, play(f, 15)[0])
+    assert not lost and not repeated and not stray
+    lost_old, *_ = lost_and_repeated(f, play(f, 15, verify=False)[0])
+    assert len(lost_old) >= 2
+
+
+def test_a_hand_sweeping_over_half_of_the_slips_after_they_are_read_costs_none():
+    """The sweep re-arms the engine, which re-reads the slip just as the lift happens (the stall hides it): the old engine
+    never read the next slip of 5 of 12 (14 of 80 in the soak)."""
+    f = Film(n=6, lift=5, hold=30, hand_over=(0, 2, 4), hand_pause=5)
+    readings, dups, errs, checks = play(f, 30)
+    lost, repeated, stray = lost_and_repeated(f, readings)
+    assert not lost and not repeated and not stray and not errs
+    assert dups >= 3                                          # the re-reads after the sweeps were recognised, not entered
+    lost_old, *_ = lost_and_repeated(f, play(f, 30, verify=False)[0])
+    assert len(lost_old) >= 1
+
+
+def test_1280x720_makes_no_difference():
+    f = Film(n=5, lift=4, hold=30, size=(1280, 720))
+    lost, repeated, stray = lost_and_repeated(f, play(f, 15)[0])
+    assert not lost and not repeated and not stray
+
+
+def test_the_re_check_costs_one_short_stall_per_slip(film):
+    clock = VClock()
+    eng = CaptureEngine(9, clock=clock)
+    ms, n_reads = [], 0
+    for k, frame in enumerate(film.frames):
+        clock.t = k / 30.0
+        u = eng.feed(frame)
+        if "verify_ms" in u.timings:
+            ms.append(u.timings["verify_ms"])
+        n_reads += u.reading is not None
+    assert n_reads == 8
+    per_slip = len(ms) / 8
+    assert per_slip <= 3 and sum(ms) / 8 < 250, (per_slip, sum(ms) / 8)         # at most ~0.25 s of re-checking per slip
+    assert max(ms) < 250
+
+
+def test_a_single_odd_look_does_not_make_a_new_slip(monkeypatch):
+    """Hysteresis: a quick look that disagrees with the slip entered is only a candidate; the full read that follows must
+    agree with it AND differ from the history. Here the quick look is wrong (shows another slip): nothing is entered."""
+    st, ids = make_stage()
+    A, B = ids[:2]
+    other = sv.fingerprint(sv.read_slip(next(st.hold(B, 1))[0]))
+    clock = VClock()
+    eng = CaptureEngine(9, clock=clock)
+    monkeypatch.setattr(sv, "quick_fingerprint", lambda frame, grid, settings=None, template=None: (other, 0.0))
+    ev = []
+    for k, (frame, info) in enumerate(list(st.empty(3)) + list(st.hold(A, 120))):
+        clock.t = k / 30.0
+        ev.append((k, info, eng.feed(frame)))
+    assert [info["top"] for _, info, _ in reads(ev)] == [A]            # only the first read
+    assert len(eng.history) == 1 and not [u for _, _, u in ev if u.error]
+    assert eng.state == WAIT_REMOVE

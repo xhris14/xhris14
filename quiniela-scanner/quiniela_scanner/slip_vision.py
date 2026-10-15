@@ -12,7 +12,7 @@ Everything works on plain numpy BGR images so it can be tested without a camera.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -25,6 +25,7 @@ BLANK = "blank"          # nothing marked
 MULTIPLE = "multiple"    # two columns marked (correction / double mark)
 WEAK = "weak"            # a mark was found but it is faint or small
 HEAVY = "heavy"          # scribbled over - probably a crossed-out mark
+OCCLUDED = "occluded"    # a hand / finger covers the row's mark cells: nothing can be said about the row
 
 
 class SlipNotFound(Exception):
@@ -340,14 +341,23 @@ def locate_grid(frame: np.ndarray, n_rows: int = 9, quad: np.ndarray | None = No
 class Settings:
     min_ink: float = 0.015          # fraction of a cell that must be inked to count as a mark
     multi_ratio: float = 0.45       # 2nd-best / best above this -> double mark
-    heavy_ink: float = 0.40         # fraction of cell inked beyond which it looks scribbled out
+    heavy_ink: float = 0.30         # fraction of cell inked beyond which it looks scribbled out (a real X: 0.13-0.19)
     weak_ink: float = 0.04          # below this a mark is flagged as faint
+    second_ink: float = 0.04        # a 2nd cell this much more inked than the slip's other off-mark cells is a 2nd mark
+                                    # whatever the ratio: a corrected mark beside a scribbled-out one has a low ratio,
+                                    # while a lone X leaves ~0.002 in the other cells (a strong colour cast: ~0.07)
+    faint_ink: float = 0.022        # BLANK rows get a second, more sensitive look: this much ink = a faint mark (WEAK)
+    thin_aspect: float = 6.0        # ink this long and thin (staple, pen slash) is not a mark (real X marks: aspect <= 1.8)
+    edge_off: float = 0.25          # ink centred this far (in row heights) from its cell's centre lies on a rule (X marks: <= 0.15)
+    hand_guard: bool = True         # look for skin: OCCLUDED rows, and tell the capture engine a hand is on the slip
+    skin_slip: float = 0.01         # share of the slip covered by skin that means "a hand is on it"
+    skin_row: float = 0.01          # share of a row's mark area (+ half a cell around) under skin: row is OCCLUDED
 
 
 @dataclass
 class SlipReading:
-    picks: list[str]                        # 'L'/'E'/'V' or '' when blank or ambiguous
-    verdicts: list[str]                     # OK / BLANK / MULTIPLE / WEAK / HEAVY per row
+    picks: list[str]                        # 'L'/'E'/'V' or '' when blank, ambiguous or hidden
+    verdicts: list[str]                     # OK / BLANK / MULTIPLE / WEAK / HEAVY / OCCLUDED per row
     ink: np.ndarray                         # (rows, 3) ink fraction per cell
     rectified: np.ndarray                   # straightened slip, BGR
     name_crop: np.ndarray                   # handwriting strip, BGR
@@ -355,6 +365,9 @@ class SlipReading:
     grid: Grid
     candidates: list[tuple[str, ...]] = field(default_factory=list)   # letters that carry ink per row
     ink_mask: np.ndarray | None = None      # _ink_mask(rectified), kept so fingerprint() need not recompute it
+    skin_fraction: float = 0.0              # share of the rectified slip covered by skin-coloured blobs
+    hand: bool = False                      # a hand is on the slip (skin_fraction >= Settings.skin_slip, or it covers a row)
+    name_hidden: bool = False               # skin covers the handwriting strip
 
     @property
     def clean(self) -> bool:
@@ -363,6 +376,10 @@ class SlipReading:
     @property
     def problem_rows(self) -> list[int]:
         return [i for i, v in enumerate(self.verdicts) if v != OK]
+
+    @property
+    def occluded_rows(self) -> list[int]:
+        return [i for i, v in enumerate(self.verdicts) if v == OCCLUDED]
 
 
 def _ink_mask(fin: np.ndarray) -> np.ndarray:
@@ -382,6 +399,99 @@ def _ink_mask(fin: np.ndarray) -> np.ndarray:
     return cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
 
+# ----- hands: skin-coloured blobs on the slip
+def skin_mask(img: np.ndarray, kernel: int = 0) -> np.ndarray:
+    """Skin-coloured blobs of a BGR image (uint8 0/255): hue red..orange, clearly more saturated than the
+    paper (median saturation + 30) yet not as saturated as the strongest inks, opened with a kernel of ~3% of
+    the width (a finger is 10-18%) so pen strokes - even 1.6 mm felt-tip circles - and specks vanish.
+    Measured: 0 pixels on clean frames under six colour casts x three exposures, with blue/black/red/orange/
+    brown ink and thick markers; every finger of the test batch is found. Blind to skin that a colour cast
+    turns grey (strong blue light)."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lo, hi = int(np.median(hsv[::4, ::4, 1])) + 31, 225
+    if lo > hi:                                          # paper more saturated than skin: cannot tell
+        return np.zeros(img.shape[:2], np.uint8)
+    m = cv2.bitwise_or(cv2.inRange(hsv, (0, lo, 41), (25, hi, 255)), cv2.inRange(hsv, (170, lo, 41), (179, hi, 255)))
+    k = kernel or max(3, int(round(0.031 * img.shape[1])) | 1)
+    return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+
+
+def hand_fraction(frame: np.ndarray, quad: np.ndarray, width: int = 480) -> float:
+    """Share of the slip outline ``quad`` (frame pixels) covered by skin: a ~3 ms 'is a hand on it?' that
+    needs no grid, so the capture engine can refuse to read (and can say so) before spending ~200 ms."""
+    q = _order_quad(quad)
+    c = q.mean(axis=0)
+    m, size = _rect_from_rough(frame, c + (q - c) * 0.94, width)         # inside the table: no background
+    mask = skin_mask(cv2.warpPerspective(frame, m, size, flags=cv2.INTER_LINEAR), 15)  # a finger is >= 48 px wide here
+    return float(cv2.countNonZero(mask)) / max(mask.size, 1)
+
+
+def _skin_report(skin: np.ndarray, g: Grid, s: Settings) -> tuple[list[bool], bool]:
+    """(per row: a hand over its mark cells?, a hand over the handwriting strip?) from a skin mask."""
+    h, w = skin.shape
+    c = g.corners
+    rows = []
+    for r in range(g.n_rows):
+        xs, ys = c[r:r + 2, :, 0], c[r:r + 2, :, 1]
+        cw = float(xs.max() - xs.min()) / 3
+        x0, x1 = max(0, int(xs.min() - 0.5 * cw)), min(w, int(xs.max() + 0.5 * cw))
+        y0, y1 = max(0, int(ys.min() - 0.5 * g.row_h)), min(h, int(ys.max() + 0.5 * g.row_h))
+        box = skin[y0:y1, x0:x1]
+        rows.append(box.size > 0 and cv2.countNonZero(box) > s.skin_row * box.size)
+    y0 = max(0, int(g.name_top_y - 0.5 * g.row_h))
+    box = skin[y0:, int(0.2 * w):int(0.975 * w)]
+    return rows, box.size > 0 and cv2.countNonZero(box) > s.skin_row * box.size
+
+
+def _faint_fractions(fin: np.ndarray, g: Grid) -> np.ndarray:
+    """(rows, 3) ink share per cell from a more sensitive pass (blur 5x5, adaptive threshold C=6): only run
+    for rows that read BLANK, to tell a dry pen / pencil from an empty box. Measured on the real photo and
+    synthetic blanks (blur 0.8, noise <= 6): 0 blank cells above 0.02; faint marks the main pass misses: >= 0.0215."""
+    h, w = fin.shape[:2]
+    c = g.corners
+    pad = 46
+    x0, x1 = max(0, int(c[..., 0].min()) - pad), min(w, int(c[..., 0].max()) + pad)
+    y0, y1 = max(0, int(c[..., 1].min()) - pad), min(h, int(c[..., 1].max()) + pad)
+    gray = cv2.cvtColor(fin[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    dark = cv2.adaptiveThreshold(cv2.GaussianBlur(gray, (5, 5), 0), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY_INV, 41, 6)
+    hk = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, int(0.04 * w)), 1)))
+    vk = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, int(0.04 * h)))))
+    lines = cv2.dilate(cv2.bitwise_or(hk, vk), cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    ink = cv2.morphologyEx(cv2.bitwise_and(dark, cv2.bitwise_not(lines)), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    out = np.zeros((g.n_rows, 3), np.float32)
+    for r in range(g.n_rows):
+        for k in range(3):
+            out[r, k] = _cell_ink(ink, g, r, k, (x0, y0))[0]
+    return out
+
+
+def _cell_ink(ink: np.ndarray, g: Grid, r: int, c: int, origin=(0, 0)):
+    """(ink share of cell (r, c), its ink pixels as a crop, the crop's top-left) - the cell polygon is shrunk 6%
+    towards its centre so the ruled lines themselves are ignored."""
+    poly = np.array([g.corners[r, c], g.corners[r, c + 1], g.corners[r + 1, c + 1], g.corners[r + 1, c]], np.float32)
+    ctr = poly.mean(axis=0)
+    poly = (ctr + (poly - ctr) * 0.94).astype(np.int32) - np.array(origin, np.int32)
+    x0, y0 = np.maximum(poly.min(axis=0), 0)
+    x1, y1 = np.minimum(poly.max(axis=0) + 1, (ink.shape[1], ink.shape[0]))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0, None, (0, 0)
+    m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillConvexPoly(m, poly - (x0, y0), 255)
+    inked = cv2.bitwise_and(ink[y0:y1, x0:x1], m)
+    return cv2.countNonZero(inked) / max(float(cv2.countNonZero(m)), 1.0), inked, (int(x0) + origin[0], int(y0) + origin[1])
+
+
+def _mark_shape(inked: np.ndarray, origin, ctr_y: float, row_h: float) -> tuple[float, float]:
+    """(aspect, off-centre) of the ink of one cell: the aspect ratio of its minimum-area rectangle (a real X: 1-2.2,
+    a staple or a slash: > 8) and how far its vertical centroid lies from the cell's centre, in row heights."""
+    ys, xs = np.nonzero(inked)
+    if ys.size < 30:
+        return 1.0, 0.0
+    (_, _), (rw, rh), _ = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+    return max(rw, rh) / max(min(rw, rh), 1.0), abs(float(ys.mean()) + origin[1] - ctr_y) / row_h
+
+
 def read_slip(frame: np.ndarray, n_rows: int = 9, settings: Settings | None = None,
               grid: Grid | None = None) -> SlipReading:
     s = settings or Settings()
@@ -389,35 +499,60 @@ def read_slip(frame: np.ndarray, n_rows: int = 9, settings: Settings | None = No
     fin = cv2.warpPerspective(frame, g.matrix, g.size, flags=cv2.INTER_CUBIC)
     ink = _ink_mask(fin)
 
+    skin_fraction, occluded, name_hidden = 0.0, [False] * g.n_rows, False
+    if s.hand_guard:
+        skin = skin_mask(fin)
+        skin_fraction = float(cv2.countNonZero(skin)) / max(skin.size, 1)
+        if skin_fraction > 0:
+            occluded, name_hidden = _skin_report(skin, g, s)
+
     fractions = np.zeros((g.n_rows, 3), np.float32)
+    cells: dict = {}
     for r in range(g.n_rows):
         for c in range(3):
-            poly = np.array([g.corners[r, c], g.corners[r, c + 1],
-                             g.corners[r + 1, c + 1], g.corners[r + 1, c]], np.float32)
-            # shrink 6% towards the centre so the ruled lines themselves are ignored
-            ctr = poly.mean(axis=0)
-            poly = ctr + (poly - ctr) * 0.94
-            m = np.zeros(ink.shape, np.uint8)
-            cv2.fillConvexPoly(m, poly.astype(np.int32), 255)
-            area = float(cv2.countNonZero(m))
-            fractions[r, c] = cv2.countNonZero(cv2.bitwise_and(ink, m)) / max(area, 1.0)
+            fractions[r, c], inked, org = _cell_ink(ink, g, r, c)
+            cells[r, c] = (inked, org)
 
+    # what an unmarked cell measures on this photo (~0.00 in even light, up to ~0.07 under a strong colour cast): the
+    # typical 2nd-strongest cell of a row - never a mark, except in the odd double-marked row
+    floor = float(np.median(np.sort(fractions, axis=1)[:, -2]))
+    faint = None
     picks, verdicts, cands = [], [], []
     for r in range(g.n_rows):
         f = fractions[r]
+        if occluded[r]:                                   # a hand over the cells: the ink there says nothing
+            picks.append("")
+            verdicts.append(OCCLUDED)
+            cands.append(())
+            continue
         order = np.argsort(f)[::-1]
         best, second = float(f[order[0]]), float(f[order[1]])
         marked = tuple(PICK_LETTERS[i] for i in range(3) if f[i] >= s.min_ink)
-        cands.append(marked)
         if best < s.min_ink:
-            picks.append("")
-            verdicts.append(BLANK)
-        elif second >= s.min_ink and second / best > s.multi_ratio:
+            if faint is None:
+                faint = _faint_fractions(fin, g)
+            fr = faint[r]
+            if float(fr.max()) >= s.faint_ink:            # a dry pen / pencil, not an empty box: show a guess, but flag it
+                marked = tuple(PICK_LETTERS[i] for i in range(3) if fr[i] >= s.faint_ink)
+                picks.append(PICK_LETTERS[int(np.argmax(fr))])
+                verdicts.append(WEAK)
+            else:
+                picks.append("")
+                verdicts.append(BLANK)
+        elif second >= s.min_ink and (second / best > s.multi_ratio or second >= floor + s.second_ink):
             picks.append("")
             verdicts.append(MULTIPLE)
         else:
-            picks.append(PICK_LETTERS[int(order[0])])
-            verdicts.append(HEAVY if best > s.heavy_ink else WEAK if best < s.weak_ink else OK)
+            c = int(order[0])
+            v = HEAVY if best > s.heavy_ink else WEAK if best < s.weak_ink else OK
+            if v == OK and cells[r, c][0] is not None:
+                ctr_y = float((g.corners[r, c, 1] + g.corners[r + 1, c, 1] + g.corners[r, c + 1, 1] + g.corners[r + 1, c + 1, 1]) / 4)
+                aspect, off = _mark_shape(cells[r, c][0], cells[r, c][1], ctr_y, g.row_h)
+                if aspect >= s.thin_aspect or off > s.edge_off:   # a staple / slash, or a mark that sits on a rule
+                    v = WEAK
+            picks.append(PICK_LETTERS[c])
+            verdicts.append(v)
+        cands.append(marked)
 
     h_img, w_img = fin.shape[:2]
     y_name0 = int(max(0, g.name_top_y - 0.18 * g.row_h))
@@ -425,7 +560,8 @@ def read_slip(frame: np.ndarray, n_rows: int = 9, settings: Settings | None = No
     y_title = int(max(g.title_bottom_y, 0.9 * g.row_h)) if g.title_bottom_y > 0 else int(g.row_h)
     title_crop = fin[0:max(10, y_title), :].copy()
     return SlipReading(picks=picks, verdicts=verdicts, ink=fractions, rectified=fin,
-                       name_crop=name_crop, title_crop=title_crop, grid=g, candidates=cands, ink_mask=ink)
+                       name_crop=name_crop, title_crop=title_crop, grid=g, candidates=cands, ink_mask=ink,
+                       skin_fraction=skin_fraction, hand=skin_fraction >= s.skin_slip or any(occluded), name_hidden=name_hidden)
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +578,8 @@ _FP_SPECK = 7                   # connected ink blobs smaller than this (raster 
 _FP_MIN_PX = 40                 # fewer ink pixels than this = nothing written there
 MARKS_SAME = 0.90               # min stroke coverage (both ways) for the marks of one slip
 NAME_SAME = 0.80                # ... and for its handwriting
+MARKS_STRONG = 0.95             # marks this alike are one slip whatever the handwriting says (a hand may cover it)
+_FP_MIN_ROWS = 4                # ... provided at least this many rows carry a mark: one or two X prove little
 
 
 @dataclass(eq=False)
@@ -451,6 +589,10 @@ class Fingerprint:
     name: np.ndarray = field(repr=False)     # binary raster of the handwriting
     marks_px: int
     name_px: int
+    occluded: tuple[int, ...] = ()           # rows hidden by a hand: they match anything (see same_slip)
+    soft: tuple[int, ...] = ()               # rows read WEAK: a faint mark may come out blank on the next photo
+    name_hidden: bool = False                # a hand covers the handwriting: it cannot tell slips apart
+    row_bands: tuple = field(default=(), repr=False)   # (y0, y1) of every row in the marks raster
 
     @property
     def name_blank(self) -> bool:
@@ -493,10 +635,8 @@ def _raster(ink: np.ndarray, x0: int, x1: int, y0: int, y1: int, size: tuple[int
     return keep[lab].astype(np.uint8)
 
 
-def fingerprint(reading: SlipReading) -> Fingerprint:
-    """Pen-ink signature of a slip (see :func:`same_slip`). ~3 ms when ``reading.ink_mask`` is set."""
-    fin, g = reading.rectified, reading.grid
-    ink = reading.ink_mask if reading.ink_mask is not None else _ink_mask(fin)
+def _fingerprint(fin: np.ndarray, g: Grid, ink: np.ndarray, picks: tuple[str, ...] = (), occluded=(), soft=(),
+                 name_hidden: bool = False) -> Fingerprint:
     c = g.corners
     inset = 3
     mx0, mx1 = int(round(float(c[:, 0, 0].mean()))) + inset, int(round(float(c[:, 3, 0].mean()))) - inset
@@ -505,9 +645,60 @@ def fingerprint(reading: SlipReading) -> Fingerprint:
     nx0, nx1, ny0, ny1 = _name_window(fin, g)
     full_h = int(round(1.15 * g.row_h - 0.08 * g.row_h))
     name = _raster(ink, nx0, nx1, ny0, ny1, _FP_NAME, full_h)
+    edges = (c[:, 0, 1] - my0) * _FP_MARKS[1] / max(my1 - my0, 1)
+    bands = tuple((int(np.floor(edges[r])) - 1, int(np.ceil(edges[r + 1])) + 1) for r in range(g.n_rows))
+    return Fingerprint(picks, marks, name, int(marks.sum()), int(name.sum()), tuple(occluded), tuple(soft),
+                       name_hidden, bands)
+
+
+def fingerprint(reading: SlipReading) -> Fingerprint:
+    """Pen-ink signature of a slip (see :func:`same_slip`). ~3 ms when ``reading.ink_mask`` is set."""
+    ink = reading.ink_mask if reading.ink_mask is not None else _ink_mask(reading.rectified)
     cands = reading.candidates or [()] * len(reading.picks)
     rows = tuple(p or "".join(c) for p, c in zip(reading.picks, cands))   # blank '' / double mark 'LV' stay distinct
-    return Fingerprint(rows, marks, name, int(marks.sum()), int(name.sum()))
+    return _fingerprint(reading.rectified, reading.grid, ink, rows,
+                        [i for i, v in enumerate(reading.verdicts) if v == OCCLUDED],
+                        [i for i, v in enumerate(reading.verdicts) if v == WEAK], reading.name_hidden)
+
+
+_ALIGN = 4                      # the registration of two photos of the slip works on images this many times smaller
+
+
+def _align_gray(fin: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(fin, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (fin.shape[1] // _ALIGN, fin.shape[0] // _ALIGN), interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(small, (0, 0), 1.0).astype(np.float32)
+
+
+def alignment_template(reading: SlipReading) -> np.ndarray:
+    """What :func:`quick_fingerprint` registers a later photo against: the rectified slip, small and grey."""
+    return _align_gray(reading.rectified)
+
+
+def quick_fingerprint(frame: np.ndarray, grid: Grid, settings: Settings | None = None,
+                      template: np.ndarray | None = None) -> tuple[Fingerprint, float]:
+    """(pen-ink signature, skin share) of whatever lies where ``grid`` was found, without the verdict logic and
+    without locating the grid again (~90 ms instead of ~190): lets the capture engine keep checking that the slip
+    it entered is still the one there. With ``template`` (see :func:`alignment_template`) the photo is first
+    registered on the printed lines (focus breathing, a nudge), which an outline of the slip is too coarse for;
+    raises SlipNotFound when that fails."""
+    s = settings or Settings()
+    matrix = grid.matrix
+    if template is not None:
+        fin = cv2.warpPerspective(frame, matrix, grid.size, flags=cv2.INTER_LINEAR)
+        warp = np.eye(2, 3, dtype=np.float32)
+        try:
+            _, warp = cv2.findTransformECC(template, _align_gray(fin), warp, cv2.MOTION_AFFINE,
+                                           (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4), None, 5)
+        except cv2.error as e:
+            raise SlipNotFound("cannot register the slip") from e
+        warp[:, 2] *= _ALIGN
+        matrix = np.linalg.inv(np.vstack([warp, [0, 0, 1]])) @ matrix       # frame -> rectified, registered
+    fin = cv2.warpPerspective(frame, matrix, grid.size, flags=cv2.INTER_CUBIC)
+    skin = skin_mask(fin)
+    share = float(cv2.countNonZero(skin)) / max(skin.size, 1)
+    hidden = _skin_report(skin, grid, s)[1] if share > 0 else False
+    return _fingerprint(fin, grid, _ink_mask(fin), name_hidden=hidden), share
 
 
 def _coverage(a: np.ndarray, b: np.ndarray) -> float:
@@ -535,16 +726,63 @@ def slip_similarity(a: Fingerprint, b: Fingerprint) -> tuple[float, float | None
     return marks, name
 
 
+def _without_rows(fp: Fingerprint, rows) -> Fingerprint:
+    """``fp`` with the ink of ``rows`` wiped from its marks raster (rows hidden in the other photo)."""
+    if not fp.row_bands:
+        return fp
+    m = fp.marks.copy()
+    for r in rows:
+        y0, y1 = fp.row_bands[r]
+        m[max(0, y0):max(0, y1)] = 0
+    return replace(fp, marks=m, marks_px=int(m.sum()))
+
+
+def _picks_alike(a: Fingerprint, b: Fingerprint, hidden: set) -> bool:
+    if len(a.picks) != len(b.picks):
+        return False
+    soft = set(a.soft) | set(b.soft)
+    for i, (x, y) in enumerate(zip(a.picks, b.picks)):
+        if x == y or i in hidden or (i in soft and "" in (x, y)):    # a faint mark may or may not be seen again
+            continue
+        return False
+    return True
+
+
+def same_ink(a: Fingerprint, b: Fingerprint, marks_min: float = MARKS_SAME) -> bool:
+    """Do two fingerprints show the same pen ink (picks are not compared)? For re-checking a slip that lies
+    where it was read: two empty slips count as alike (nothing to tell them apart by). ``marks_min`` is the
+    stroke coverage the marks need (the handwriting needs NAME_SAME, scaled down alike)."""
+    hidden = set(a.occluded) | set(b.occluded)
+    if hidden:
+        a, b = _without_rows(a, hidden), _without_rows(b, hidden)
+    if a.marks_px < _FP_MIN_PX and b.marks_px < _FP_MIN_PX and a.name_blank and b.name_blank:
+        return True
+    marks, name = slip_similarity(a, b)
+    if a.name_hidden or b.name_hidden:
+        name = None
+    return marks >= marks_min and (name is None or name >= NAME_SAME * marks_min / MARKS_SAME)
+
+
 def same_slip(a: Fingerprint, b: Fingerprint) -> bool:
     """True when two readings are the same physical slip (re-photographed, moved a little,
-    relit), False for a different slip - even one with identical picks."""
-    if a.picks != b.picks:
+    relit, partly under a hand), False for a different slip - even one with identical picks.
+    Rows a hand covered in either photo are ignored; marks that match as well as one slip's
+    two photos do decide on their own (a hand over the name strip must not make a new slip)."""
+    hidden = set(a.occluded) | set(b.occluded)
+    if not _picks_alike(a, b, hidden):
         return False
+    if hidden:
+        a, b = _without_rows(a, hidden), _without_rows(b, hidden)
+    marks, name = slip_similarity(a, b)
+    informative = sum(1 for i, p in enumerate(a.picks) if p and i not in hidden) >= _FP_MIN_ROWS
+    if informative and a.marks_px >= 3 * _FP_MIN_PX and b.marks_px >= 3 * _FP_MIN_PX and marks >= MARKS_STRONG:
+        return True
+    if a.name_hidden or b.name_hidden:                  # no handwriting to compare: the marks have to carry it
+        return a.marks_px >= _FP_MIN_PX and b.marks_px >= _FP_MIN_PX and marks >= MARKS_SAME
     if a.name_blank != b.name_blank:                    # someone wrote / nobody wrote a name
         return False
     if a.name_blank and a.marks_px < _FP_MIN_PX and b.marks_px < _FP_MIN_PX:
         return False                                    # nothing written at all: cannot tell
-    marks, name = slip_similarity(a, b)
     return marks >= MARKS_SAME and (name is None or name >= NAME_SAME)
 
 
@@ -552,25 +790,32 @@ def same_slip(a: Fingerprint, b: Fingerprint) -> bool:
 # Drawing helpers (UI + debugging)
 # --------------------------------------------------------------------------- #
 _VERDICT_COLOUR = {OK: (60, 180, 60), BLANK: (0, 0, 220), MULTIPLE: (0, 140, 255),
-                   WEAK: (0, 200, 255), HEAVY: (0, 140, 255)}
+                   WEAK: (0, 200, 255), HEAVY: (0, 140, 255), OCCLUDED: (200, 0, 200)}
 
 
 def draw_reading(reading: SlipReading) -> np.ndarray:
-    """Rectified slip with the detected pick circled in each row."""
+    """Rectified slip with the detected pick circled in each row (a row under a hand is tinted magenta, labelled HAND)."""
     out = reading.rectified.copy()
     g = reading.grid
     for r in range(g.n_rows):
         colour = _VERDICT_COLOUR[reading.verdicts[r]]
+        hidden = reading.verdicts[r] == OCCLUDED
+        if hidden:
+            poly = np.array([g.corners[r, 0], g.corners[r, 3], g.corners[r + 1, 3], g.corners[r + 1, 0]], np.int32)
+            tint = out.copy()
+            cv2.fillConvexPoly(tint, poly, colour)
+            out = cv2.addWeighted(tint, 0.4, out, 0.6, 0)
+            cv2.polylines(out, [poly], True, colour, 3)
         pk = reading.picks[r]
         cols = [PICK_LETTERS.index(pk)] if pk else [PICK_LETTERS.index(x) for x in reading.candidates[r]]
-        if not cols:
+        if not cols and not hidden:
             ctr = (g.corners[r, 0] + g.corners[r + 1, 3]) / 2
             cv2.putText(out, "?", (int(ctr[0]) - 8, int(ctr[1]) + 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, colour, 3)
         for c in cols:
             ctr = (g.corners[r, c] + g.corners[r, c + 1] + g.corners[r + 1, c] + g.corners[r + 1, c + 1]) / 4
             rad = int(0.36 * min(np.linalg.norm(g.corners[r, c + 1] - g.corners[r, c]), g.row_h))
             cv2.circle(out, (int(ctr[0]), int(ctr[1])), max(rad, 8), colour, 3)
-        lab = f"{r + 1}:{pk or ('F1' if reading.verdicts[r] == BLANK else '??')}"
+        lab = f"{r + 1}:{pk or ('F1' if reading.verdicts[r] == BLANK else 'HAND' if hidden else '??')}"
         y = int(g.corners[r, 3][1] + 0.62 * g.row_h)
         (tw, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
         x = out.shape[1] - tw - 14                       # right margin, clear of the team names
