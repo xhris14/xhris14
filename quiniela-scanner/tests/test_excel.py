@@ -44,12 +44,34 @@ def test_write_puts_name_and_picks_and_leaves_T_formula(sink):
     assert s.next_slot().ticket == 252                                # advances
 
 
-def test_blank_pick_leaves_cell_empty(sink):
+def test_empty_box_becomes_F1_in_size_9_and_undo_restores_font(sink):
     s, path = sink
     slot = s.next_slot()
-    s.write(slot, "X", ["L", "", "E", "", "", "", "", "", "V"])
+    rc = s.write(slot, "X", ["L", "", "E", "", "", "", "", "", "V"])
     ws = openpyxl.load_workbook(path)["ENTRY PG1"]
-    assert [ws.cell(slot.row, 15 + k).value for k in range(9)] == ["L", None, "E", None, None, None, None, None, "V"]
+    assert [ws.cell(slot.row, 15 + k).value for k in range(9)] == ["L", "F1", "E", "F1", "F1", "F1", "F1", "F1", "V"]
+    sizes = [ws.cell(slot.row, 15 + k).font.sz for k in range(9)]
+    assert sizes == [11, 9, 11, 9, 9, 9, 9, 9, 11]                    # only the F1 boxes are size 9
+    assert ws.cell(slot.row, 14).font.sz == 11                          # the name is untouched
+    s.undo(rc)
+    ws = openpyxl.load_workbook(path)["ENTRY PG1"]
+    assert all(ws.cell(slot.row, 14 + k).value is None for k in range(10))
+    assert [ws.cell(slot.row, 15 + k).font.sz for k in range(9)] == [11] * 9
+
+
+def test_missing_trailing_picks_count_as_empty_and_marker_can_be_switched_off(tmp_path):
+    p = make_pool_workbook(tmp_path / "w.xlsx")
+    s = ExcelSink(OpenpyxlBackend(str(p)))
+    slot = s.next_slot()
+    s.write(slot, "SHORT", ["L", "E"])                                  # only 2 picks supplied
+    ws = openpyxl.load_workbook(p)["ENTRY PG1"]
+    assert [ws.cell(slot.row, 15 + k).value for k in range(9)] == ["L", "E"] + ["F1"] * 7
+    off = ExcelSink(OpenpyxlBackend(str(p)), blank_marker="")
+    slot2 = off.next_slot()
+    off.write(slot2, "PLAIN", ["L", ""] + [""] * 7)
+    ws = openpyxl.load_workbook(p)["ENTRY PG1"]
+    assert [ws.cell(slot2.row, 15 + k).value for k in range(9)] == ["L"] + [None] * 8
+    assert ws.cell(slot2.row, 16).font.sz == 11
 
 
 def test_refuses_to_overwrite_then_allows(sink):
@@ -147,20 +169,33 @@ class _Cnt:
         self.Count = n
 
 
+class _Font:
+    Size = 11
+
+
+class _Cell:
+    def __init__(self, ws, r, c):
+        self.ws, self.r, self.c = ws, r, c
+
+    @property
+    def Font(self):
+        return self.ws.fonts.setdefault((self.r, self.c), _Font())
+
+
 class _Sheet:
     def __init__(self, name, cells):
-        self.Name, self.cells = name, cells
+        self.Name, self.cells, self.fonts = name, cells, {}
 
     class _Cells:
         def __init__(s, ws): s.ws = ws
-        def __call__(s, r, c): return (r, c)
+        def __call__(s, r, c): return _Cell(s.ws, r, c)
 
     @property
     def Cells(self):
         return _Sheet._Cells(self)
 
     def Range(self, a, b):
-        return _Rng(self, a[0], a[1], b[0], b[1])
+        return _Rng(self, a.r, a.c, b.r, b.c)
 
     @property
     def UsedRange(self):
@@ -219,6 +254,14 @@ def test_com_backend_against_fake_excel_object_model(tmp_path):
     assert cells[(slot.row, 14)] == "CLEMENTE O. RRR"
     assert [cells[(slot.row, 15 + k)] for k in range(9)] == list("LVLLLLLLE")
     assert sink.next_slot().ticket == 252
+    # an empty box: "F1" in font size 9 through Range.Value / Font.Size, restored by undo
+    slot2 = sink.next_slot()
+    rc = sink.write(slot2, "ANA", ["L", "", "E", "V", "V", "V", "V", "V", "V"])
+    assert cells[(slot2.row, 16)] == "F1"
+    assert book.Worksheets("ENTRY PG1").fonts[(slot2.row, 16)].Size == 9
+    assert book.Worksheets("ENTRY PG1").fonts[(slot2.row, 15)].Size == 11        # normal cells keep their size
+    sink.undo(rc)
+    assert (slot2.row, 16) not in cells and book.Worksheets("ENTRY PG1").fonts[(slot2.row, 16)].Size == 11
     assert ComBackend(workbook_hint="other", app=app).workbook_name == "OTHER.xlsx"
     with pytest.raises(ExcelError):
         ComBackend(workbook_hint="nope", app=app)

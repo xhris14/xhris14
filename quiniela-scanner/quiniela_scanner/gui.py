@@ -24,7 +24,7 @@ from .name_reader import NameResult, make_reader
 
 FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
 GOOD, WARN, BAD = "#1b7f3b", "#b36b00", "#c62828"
-VERDICT_TEXT = {sv.BLANK: "no mark", sv.MULTIPLE: "two marks", sv.WEAK: "faint mark", sv.HEAVY: "scribbled?"}
+VERDICT_TEXT = {sv.MULTIPLE: "two marks", sv.WEAK: "faint mark", sv.HEAVY: "scribbled?"}
 
 
 def _to_photo(img_bgr: np.ndarray, width: int | None = None, height: int | None = None) -> ImageTk.PhotoImage:
@@ -65,6 +65,7 @@ class App(tk.Tk):
         self.engine = CaptureEngine(cfg.matches_per_slip, cfg.stable_frames,
                                     sv.Settings(min_ink=cfg.min_ink, multi_ratio=cfg.multi_ratio))
         self.pending: Pending | None = None
+        self.marker = (cfg.blank_marker or "-")      # what an empty box turns into ("F1")
         self._scan_id = 0
         self.sink: ExcelSink | None = None
         self.backend = None
@@ -191,7 +192,7 @@ class App(tk.Tk):
             v = tk.StringVar(value="")
             self.pick_vars.append(v)
             self.pick_lbls.append(lbl)
-            for j, (txt, val) in enumerate((("L", "L"), ("E", "E"), ("V", "V"), ("-", ""))):
+            for j, (txt, val) in enumerate((("L", "L"), ("E", "E"), ("V", "V"), (self.marker, ""))):
                 ttk.Radiobutton(grid, text=txt, value=val, variable=v, command=lambda k=i: self.pick_edited(k)
                                 ).grid(row=row, column=col + 1 + j, padx=2)
             note = ttk.Label(grid, text="", width=11, foreground=WARN)
@@ -282,7 +283,8 @@ class App(tk.Tk):
         try:
             self.backend = self._fixed_backend or open_backend(self.cfg.backend, self.cfg.workbook, self.cfg.workbook_path)
             self.sink = ExcelSink(self.backend, self.cfg.sheets, self.cfg.name_header,
-                                  self.cfg.uppercase_names, self.cfg.save_after_write)
+                                  self.cfg.uppercase_names, self.cfg.save_after_write,
+                                  self.cfg.blank_marker, self.cfg.blank_font_size)
         except ExcelError as e:
             self.sink = None
             self.excel_var.set(f"Excel: NOT CONNECTED - {e}")
@@ -371,9 +373,9 @@ class App(tk.Tk):
         self.name_var.set("")
         for i, (v, (lbl, note)) in enumerate(zip(self.pick_vars, self.pick_lbls)):
             v.set(rd.picks[i])
-            bad = rd.verdicts[i] != sv.OK
-            lbl.configure(foreground=BAD if bad else "black")
-            note.configure(text=VERDICT_TEXT.get(rd.verdicts[i], ""))
+            verdict = rd.verdicts[i]
+            lbl.configure(foreground="black" if verdict == sv.OK else WARN if verdict == sv.BLANK else BAD)
+            note.configure(text=f"empty = {self.marker}" if verdict == sv.BLANK else VERDICT_TEXT.get(verdict, ""))
         if self.reader is not None:
             self.name_note.set("Reading handwriting...")
             threading.Thread(target=self._read_name, args=(self._scan_id, rd), daemon=True).start()
@@ -381,9 +383,15 @@ class App(tk.Tk):
             self.pending.name_done = True
             self.name_note.set(self.reader_note)
             self.name_entry.focus_set()
-        flagged = rd.problem_rows
-        self.status_var.set("Slip captured." if not flagged else
-                            "Check row(s) " + ", ".join(str(i + 1) for i in flagged) + " (marked red).")
+        blanks = [i + 1 for i, v in enumerate(rd.verdicts) if v == sv.BLANK]
+        flagged = [i + 1 for i, v in enumerate(rd.verdicts) if v not in (sv.OK, sv.BLANK)]
+        msg = "Slip captured."
+        if blanks:
+            msg += f" Empty box in match {', '.join(map(str, blanks))} -> {self.marker}."
+        if flagged:
+            msg = "Check row(s) " + ", ".join(map(str, flagged)) + " (marked red)." + \
+                  (f" Empty: {', '.join(map(str, blanks))} -> {self.marker}." if blanks else "")
+        self.status_var.set(msg)
         self.name_entry.focus_set()
 
     def _read_name(self, scan_id: int, rd: sv.SlipReading):
@@ -462,13 +470,20 @@ class App(tk.Tk):
         lbl.configure(foreground="black")
         note.configure(text="")
 
+    def auto_eligible(self, rd: sv.SlipReading) -> bool:
+        """Every row is clear - or simply empty (F1), as long as not too many are empty."""
+        if any(v not in (sv.OK, sv.BLANK) for v in rd.verdicts):
+            return False
+        blanks = sum(v == sv.BLANK for v in rd.verdicts)
+        return blanks == 0 or (self.cfg.auto_enter_blanks and blanks <= self.cfg.auto_enter_max_blank)
+
     def maybe_auto(self):
         p = self.pending
         if p is None or p.touched or not self.auto_var.get() or self.sink is None:
             return
         exp = self.expected_jornada()
         jornada_bad = bool(p.slip_jornada and exp and p.slip_jornada != exp)
-        ok = (p.reading.clean and p.name_done and self.name_var.get().strip() and not jornada_bad
+        ok = (self.auto_eligible(p.reading) and p.name_done and self.name_var.get().strip() and not jornada_bad
               and (p.name_legible or self.reader is None) and self.target_slot() is not None)
         if not ok:
             p.auto_deadline = None
@@ -500,11 +515,7 @@ class App(tk.Tk):
             self.status_var.set("Type the name first.")
             return
         picks = [v.get() for v in self.pick_vars]
-        blanks = [str(i + 1) for i, x in enumerate(picks) if not x]
-        if blanks and not auto and not messagebox.askyesno(
-                "Missing picks", "No pick for match " + ", ".join(blanks) + ".\nEnter the slip anyway "
-                "(those cells stay empty)?"):
-            return
+        shown = [x or self.marker for x in picks]
         try:                                   # pick up anything typed into Excel by hand since the last scan
             self.sink.refresh()
         except ExcelError as e:
@@ -530,16 +541,16 @@ class App(tk.Tk):
             self.cancel_auto()
             messagebox.showerror("Excel", str(e))
             return
-        status = "auto" if auto else ("checked" if p.touched or not p.reading.clean else "ok")
-        self.audit.record(p.reading, picks, final_name, getattr(self.backend, "workbook_name", ""),
+        status = "auto" if auto else ("checked" if p.touched or not self.auto_eligible(p.reading) else "ok")
+        self.audit.record(p.reading, shown, final_name, getattr(self.backend, "workbook_name", ""),
                           receipt.sheet, receipt.row, receipt.ticket, status)
         self._row_id += 1
         iid = str(self._row_id)
         self.receipts.append((iid, receipt))
         self.tree.insert("", 0, iid=iid, values=(
             time.strftime("%H:%M:%S"), receipt.ticket if receipt.ticket is not None else f"row {receipt.row}",
-            final_name, " ".join(x or "-" for x in picks), status))
-        self.last_var.set(f"Last entered: ticket {receipt.ticket}  {final_name}   {' '.join(x or '-' for x in picks)}")
+            final_name, " ".join(shown), status))
+        self.last_var.set(f"Last entered: ticket {receipt.ticket}  {final_name}   {' '.join(shown)}")
         self.clear_card()
         self.refresh_blocks()
 

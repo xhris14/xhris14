@@ -125,6 +125,45 @@ def test_unsure_name_or_edit_blocks_auto_enter(env):
         app.destroy()
 
 
+def _photo_with(tmp, picks, name="p.jpg"):
+    photo = tmp / name
+    cv2.imwrite(str(photo), on_webcam_canvas(draw_slip(picks, rng=np.random.default_rng(1)), scale=0.5, angle=4))
+    return photo
+
+
+def test_one_empty_box_auto_enters_as_F1_size_9(env):
+    tmp, _ = env
+    picks = list("LVLL") + [""] + list("LLVE")                          # match 5 left empty
+    app, xlsx = make_app(tmp, _photo_with(tmp, picks), auto_enter_delay_s=0.3,
+                         reader=FakeReader(NameResult("ANA", "12", True)))
+    try:
+        assert pump(app, lambda: app.pending is not None)
+        assert app.pick_lbls[4][1].cget("text") == "empty = F1"
+        assert pump(app, lambda: len(app.tree.get_children()) == 1, 20), "an empty box should not block auto-enter"
+        ws = openpyxl.load_workbook(xlsx)["ENTRY PG1"]
+        assert [ws.cell(15, 15 + k).value for k in range(9)] == list("LVLL") + ["F1"] + list("LLVE")
+        assert ws.cell(15, 19).font.sz == 9 and ws.cell(15, 18).font.sz != 9
+        assert "F1" in app.tree.item(app.tree.get_children()[0], "values")[3]
+    finally:
+        app.destroy()
+
+
+def test_three_empty_boxes_need_a_human_then_all_become_F1(env):
+    tmp, _ = env
+    picks = ["", "V", "L", "", "L", "L", "", "V", "E"]
+    app, xlsx = make_app(tmp, _photo_with(tmp, picks, "three.jpg"), auto_enter_delay_s=0.3,
+                         reader=FakeReader(NameResult("ANA", "12", True)))
+    try:
+        assert pump(app, lambda: app.pending is not None and app.pending.name_done)
+        pump(app, lambda: False, 1.2)
+        assert app.pending is not None and not app.tree.get_children()   # too many empties: waits for Enter
+        app.commit()                                                     # no pop-up, F1 is shown on the card
+        ws = openpyxl.load_workbook(xlsx)["ENTRY PG1"]
+        assert [ws.cell(15, 15 + k).value for k in range(9)] == ["F1", "V", "L", "F1", "L", "L", "F1", "V", "E"]
+    finally:
+        app.destroy()
+
+
 def test_flagged_rows_need_a_human(env):
     tmp, _ = env
     picks = ["L", "", "LV"] + list("ELLVE")[:6]

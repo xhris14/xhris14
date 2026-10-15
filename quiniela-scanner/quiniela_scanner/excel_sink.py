@@ -19,7 +19,8 @@ import fnmatch
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass
+from copy import copy
+from dataclasses import dataclass, field
 from pathlib import Path
 
 N_PICKS = 9
@@ -215,7 +216,12 @@ class OpenpyxlBackend:
                                               max_col=ws.max_column, values_only=True)]
         return Snapshot(1, 1, rows or [[None]])
 
-    def write_row(self, sheet: str, row: int, col: int, values: list):
+    def font_sizes(self, sheet: str, row: int, col: int, n: int) -> list:
+        self._load()
+        ws = self._wb[sheet]
+        return [ws.cell(row=row, column=col + i).font.sz for i in range(n)]
+
+    def write_row(self, sheet: str, row: int, col: int, values: list, font_sizes: dict | None = None):
         self._load()
         ws = self._wb[sheet]
         for i, v in enumerate(values):
@@ -223,6 +229,11 @@ class OpenpyxlBackend:
             cell.value = v
             if isinstance(v, str):
                 cell.data_type = "s"          # never let a name like "=1" become a formula
+        for off, size in (font_sizes or {}).items():
+            cell = ws.cell(row=row, column=col + off)
+            f = copy(cell.font)
+            f.sz = size
+            cell.font = f
         self._wb.save(self.path)
 
     def save(self):
@@ -308,11 +319,19 @@ class ComBackend:
             return Snapshot(top, left, vals)
         return self._retry(go)
 
-    def write_row(self, sheet: str, row: int, col: int, values: list):
+    def font_sizes(self, sheet: str, row: int, col: int, n: int) -> list:
+        def go():
+            ws = self.wb.Worksheets(sheet)
+            return [ws.Cells(row, col + i).Font.Size for i in range(n)]
+        return self._retry(go)
+
+    def write_row(self, sheet: str, row: int, col: int, values: list, font_sizes: dict | None = None):
         def go():
             ws = self.wb.Worksheets(sheet)
             vals = [("'" + v) if isinstance(v, str) and needs_text_prefix(v) else v for v in values]
             ws.Range(ws.Cells(row, col), ws.Cells(row, col + len(vals) - 1)).Value = (tuple(vals),)
+            for off, size in (font_sizes or {}).items():
+                ws.Cells(row, col + off).Font.Size = size
         self._retry(go)
 
     def save(self):
@@ -341,12 +360,16 @@ class Receipt:
     previous: list
     written: list
     ticket: int | None
+    prev_sizes: dict = field(default_factory=dict)     # font sizes to put back on undo: {offset: size}
 
 
 class ExcelSink:
     def __init__(self, backend, sheet_patterns=("ENTRY*",), name_header="NOMBRE",
-                 uppercase: bool = True, save_after_write: bool = False):
+                 uppercase: bool = True, save_after_write: bool = False,
+                 blank_marker: str = "F1", blank_font_size: int = 9):
         self.backend = backend
+        self.blank_marker = blank_marker
+        self.blank_font_size = blank_font_size
         self.patterns = list(sheet_patterns) or ["*"]
         self.name_header = name_header
         self.uppercase = uppercase
@@ -429,17 +452,23 @@ class ExcelSink:
         if not allow_overwrite and not slot_is_free(snap, b, slot.row):
             raise SlotTaken(f"{slot.describe()} already has data")
         previous = [snap.get(slot.row, b.name_col + k) for k in range(N_PICKS + 1)]
-        letters = [p if p in ("L", "E", "V") else None for p in picks]
-        letters += [None] * (N_PICKS - len(letters))
+        fill = self.blank_marker or None                 # box the player left empty -> "F1" (or stays empty)
+        letters = [p if p in ("L", "E", "V") else fill for p in picks]
+        letters += [fill] * (N_PICKS - len(letters))
         values = [name] + letters[:N_PICKS]
-        self.backend.write_row(b.sheet, slot.row, b.name_col, values)
+        small = {k: self.blank_font_size for k, v in enumerate(values) if k >= 1 and v is not None and v == fill}
+        prev_sizes = {}
+        if small:
+            sizes = self.backend.font_sizes(b.sheet, slot.row, b.name_col, N_PICKS + 1)
+            prev_sizes = {k: sizes[k] for k in small if sizes[k]}
+        self.backend.write_row(b.sheet, slot.row, b.name_col, values, small)
         if self.save_after_write:
             self.backend.save()
         self.snaps[b.sheet] = self.backend.snapshot(b.sheet)
-        return Receipt(slot, b.sheet, slot.row, b.name_col, previous, values, slot.ticket)
+        return Receipt(slot, b.sheet, slot.row, b.name_col, previous, values, slot.ticket, prev_sizes)
 
     def undo(self, r: Receipt):
-        self.backend.write_row(r.sheet, r.row, r.col, list(r.previous))
+        self.backend.write_row(r.sheet, r.row, r.col, list(r.previous), r.prev_sizes or None)
         if self.save_after_write:
             self.backend.save()
         self.snaps[r.sheet] = self.backend.snapshot(r.sheet)

@@ -61,7 +61,7 @@ Nothing is hard-coded to column letters. On every sheet named `ENTRY*` it looks 
 
 Auto-enter only fires when *all* of these hold; otherwise it waits for you:
 
-* all 9 rows have exactly one clear mark (blank rows, double marks, faint or scribbled marks are shown in red),
+* every row has one clear mark, or is simply empty (see §4b). Double marks, faint or scribbled marks are shown in red and always wait for you,
 * Claude read the name confidently (if you type or fix a name yourself, press **Enter** to write it), and the slip's jornada matches the workbook's
   (`JORNADA 10 PC.xlsx` → 10; a slip printed "JORNADA 12" is flagged),
 * the target ticket exists and is free.
@@ -80,7 +80,19 @@ row type the letters (one letter is fine), choose **Before name** or **After nam
 * If the slip already has the tag as its own word at that end (`TONY 5000 RRR`) it is not added twice. A tag of `E`
   is still added to `JOSE` or `ELENA`, because those are letters inside a name, not a tag.
 
-A row left blank on the slip stays blank in Excel (your "F1" rule is yours to apply). **`scans/`** keeps a picture of every
+### 4b. Empty boxes become `F1`
+
+If a player leaves a match unmarked, that pick cell is filled with **`F1` in font size 9** (the rest of the row keeps its normal
+font). On the card the row shows `empty = F1`, and the "Will be written" picks use `F1` too.
+
+* A slip with 1–2 empty boxes still auto-enters. **3 or more empty boxes wait for you** (that usually means the camera missed
+  something, e.g. a blank or badly lit slip). Change this with `auto_enter_max_blank`, or set `auto_enter_blanks` to `false` to
+  always review slips that have an empty box.
+* If you click **F1** on a row yourself, the same happens.
+* **Undo last** removes the `F1` *and* puts the cell's previous font size back.
+* Don't want the rule? Set `blank_marker` to `""` in `config.json` and empty boxes stay empty.
+
+**`scans/`** keeps a picture of every
 entered slip plus `log.csv`, so any dispute can be checked against what the camera saw.
 
 ## 5. Reading the handwritten name
@@ -104,6 +116,8 @@ goes in; Claude flags names it is unsure about and those never auto-enter.
 | `name_tag`, `name_tag_position`, `tag_separator` | remembered group-tag letters, `before` / `after`, and what goes between tag and name (default one space) |
 | `uppercase_names` | write names in capitals |
 | `auto_enter`, `auto_enter_delay_s` | hands-free entry and the cancel window |
+| `blank_marker`, `blank_font_size` | text and font size for an empty box (`"F1"`, `9`; `""` = leave empty) |
+| `auto_enter_blanks`, `auto_enter_max_blank` | whether empty boxes may auto-enter, and how many (default yes, up to 2) |
 | `save_after_write` | also press Save in Excel after each ticket (AutoSave normally covers this) |
 | `expected_jornada` | blank = take it from the workbook name |
 | `min_ink`, `multi_ratio` | mark sensitivity – run `run.bat scan photo.jpg` to see the ink readings per cell |
@@ -132,7 +146,7 @@ run.bat cameras                  list webcams
 
 ## 9. What was tested, and what was not
 
-Tested (automated, 43 tests): the slip reader on your real photo (all 9 marks, row for row) and on 13 degraded
+Tested (automated, 46 tests): the slip reader on your real photo (all 9 marks, row for row) and on 13 degraded
 versions of it (small, rotated ±25°, upside-down, blurred, noisy, dark, no blue pen, perspective); empty/unrelated pictures are
 rejected; the capture logic (waits for stillness, reads once, needs the slip removed); Excel block discovery, free-ticket
 choice, writing, undo, formula-safe names – against a workbook laid out like your screenshot; and the real window driven end to

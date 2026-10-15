@@ -449,7 +449,7 @@ def draw_reading(reading: SlipReading) -> np.ndarray:
             ctr = (g.corners[r, c] + g.corners[r, c + 1] + g.corners[r + 1, c] + g.corners[r + 1, c + 1]) / 4
             rad = int(0.36 * min(np.linalg.norm(g.corners[r, c + 1] - g.corners[r, c]), g.row_h))
             cv2.circle(out, (int(ctr[0]), int(ctr[1])), max(rad, 8), colour, 3)
-        lab = f"{r + 1}:{pk or '-'}"
+        lab = f"{r + 1}:{pk or ('F1' if reading.verdicts[r] == BLANK else '??')}"
         y = int(g.corners[r, 3][1] + 0.62 * g.row_h)
         (tw, th), _ = cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
         x = out.shape[1] - tw - 14                       # right margin, clear of the team names

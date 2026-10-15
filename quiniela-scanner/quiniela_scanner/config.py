@@ -45,6 +45,12 @@ class Config:
     read_names_with_claude: bool = True  # needs ANTHROPIC_API_KEY; otherwise you type the name
     claude_model: str = "claude-opus-5-5"
 
+    # --- empty boxes ------------------------------------------------------
+    blank_marker: str = "F1"             # written in a pick box the player left empty ("" = leave the cell empty)
+    blank_font_size: int = 9             # font size of that marker
+    auto_enter_blanks: bool = True       # an empty box (F1) alone does not stop auto-enter ...
+    auto_enter_max_blank: int = 2        # ... but more than this many empty boxes needs a human look
+
     # --- behaviour --------------------------------------------------------
     auto_enter: bool = True              # write clean scans without a click
     auto_enter_delay_s: float = 3.0      # review window before an automatic write (0 = instant)
