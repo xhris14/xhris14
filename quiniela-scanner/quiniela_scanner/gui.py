@@ -756,7 +756,7 @@ class App(tk.Tk):
             wb = getattr(self.backend, "workbook_name", "")
             same = self.sel_block is not None and wb == self._connected_wb
             self._connected_wb = wb
-            self._shown_layout = ()                       # (a fresh connect shows the layout warnings again)
+            self._shown_layout = None                     # (a fresh connect judges the layout again - and drops a warning that is fixed)
             self.refresh_blocks(select_default=not same)
         except Exception as e:
             msg = str(e) if isinstance(e, ExcelError) else f"{e.__class__.__name__}: {e}"
@@ -1738,6 +1738,8 @@ class App(tk.Tk):
         p = self.pending
         if p is None or p.touched or p.hold or not self.auto_var.get() or self.sink is None:
             return
+        if self.cfg.auto_enter_delay_s <= 0 or self._block_confirm:
+            return              # fast mode never auto-writes a card (it waits for a human), and a new block needs one too
         exp = self.expected_jornada()
         jornada_bad = bool(p.slip_jornada and exp and p.slip_jornada != exp)
         ok = (self.auto_eligible(p.reading) and p.name_done and self.name_var.get().strip() and not jornada_bad

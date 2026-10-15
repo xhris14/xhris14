@@ -587,6 +587,7 @@ def test_the_next_block_of_the_same_group_is_preferred(env, mk2, readings):
     reader = ScriptedReader()
     app, backend = mk2(reader=reader, wb=dict(filled=(52, 3, 3), suffixes=("RRR", "CH", "RRR")))
     # block 1 [RRR] is full, block 2 is [CH], block 3 is [RRR]: the stack of group RRR goes on in block 3
+    app.select_info(app.infos[0])                              # (the operator is working in block 1, which is full)
     inject(app, reader, readings[0], good("A0"))
     assert pump(app, lambda: app.pending is not None)
     assert "[RRR]" in app.block_var.get() and app._block_confirm == app.block_var.get() and app.ticket_var.get() == "724"
@@ -640,9 +641,10 @@ def test_a_card_entry_with_a_warning_is_also_just_a_notice(env, mk2, flagged):
 def test_layout_warnings_are_shown_once_at_connect_and_go_when_fixed(env, mk2):
     app, backend = mk2(reader=None)
     assert not app.notice_var.get() and not app.sink.layout_warnings
-    backend.type_by_hand(30, base.NAME_COL - 1, "276 ")        # a ticket stored as text cuts block 1 short
+    backend.type_by_hand(30, base.NAME_COL - 1, "266 ")        # a ticket stored as text cuts block 1 short (row 30 is ticket 266)
     app.connect_excel()
     assert "EXCEL LAYOUT" in app.notice_var.get() and "block ends at row 29" in app.notice_var.get()
+    app.update()
     assert app.notice_frame.winfo_ismapped()
     app.flush_io()
     log = (env[0] / "scanner.log").read_text()
@@ -651,8 +653,9 @@ def test_layout_warnings_are_shown_once_at_connect_and_go_when_fixed(env, mk2):
     assert app.notice_var.get().count("EXCEL LAYOUT") == 1
     app.flush_io()
     assert (env[0] / "scanner.log").read_text().count("LAYOUT_WARNING") == len(app.sink.layout_warnings)
-    backend.type_by_hand(30, base.NAME_COL - 1, 276)
+    backend.type_by_hand(30, base.NAME_COL - 1, 266)
     app.connect_excel()
+    app.update()
     assert not app.notice_var.get() and not app.notice_frame.winfo_ismapped()
 
 
@@ -815,13 +818,14 @@ def test_a_slow_camera_gets_a_persistent_amber_warning_and_its_rate_in_the_strip
     app, backend = mk2(reader=None)
     app._stop_camera()
     app.grabber = FakeGrabber(8.0)
-    t = 1000.0
+    t = time.perf_counter() + 1000.0                           # (a fake clock ahead of the real one, which app.update() uses)
     for _ in range(gui.FPS_CHECKS - 1):                        # a dip is not a warning ...
         app.check_camera(t)
         t += 1.1
     assert "CAMERA IS SLOW" not in app.notice_var.get() and "camera 8 fps" in app.stats_var.get()
     app.check_camera(t)                                        # ... three checks in a row are
     assert "CAMERA IS SLOW" in app.notice_var.get() and "Low Light Compensation" in app.notice_var.get()
+    app.update()
     assert "slips may be missed" in app.notice_var.get() and app.notice_frame.winfo_ismapped()
     app.dismiss_notices()                                      # dismissed: stays away while it is the same warning
     t += 1.1
@@ -856,7 +860,7 @@ def test_slips_read_are_counted_and_a_late_slip_is_flagged_once(env, mk2):
     assert not app.notice_var.get()
     t += 3.0
     app.note_slip(t + 7.5)                                     # 7.5 s gap: well over 2.5 x the 2 s pace
-    assert "A SLIP MAY HAVE BEEN SKIPPED" in app.notice_var.get() and "7 s" in app.notice_var.get().replace("7.5", "7")
+    assert "A SLIP MAY HAVE BEEN SKIPPED" in app.notice_var.get() and "8 s passed" in app.notice_var.get()
     app.flush_io()
     assert (env[0] / "scanner.log").read_text().count("SLIP_GAP") == 1
     app.dismiss_notices()
