@@ -4,6 +4,7 @@ import pytest
 from quiniela_scanner.excel_sink import (ComBackend, ExcelError, ExcelSink, OpenpyxlBackend, SlotTaken,
                                          discover_blocks, needs_text_prefix, Snapshot)
 from helpers import make_pool_workbook
+from test_excel_fast import FakeBook, FakeSheet, pool_app
 
 
 @pytest.fixture
@@ -144,107 +145,11 @@ def test_block_without_ticket_column():
 
 
 # ------------------------------------------------------------------ fake Excel COM object model
-class _Rng:
-    def __init__(self, ws, r1, c1, r2, c2):
-        self.ws, self.r1, self.c1, self.r2, self.c2 = ws, r1, c1, r2, c2
-
-    @property
-    def Value(self):
-        rows = tuple(tuple(self.ws.cells.get((r, c)) for c in range(self.c1, self.c2 + 1))
-                     for r in range(self.r1, self.r2 + 1))
-        return rows[0][0] if len(rows) == 1 and len(rows[0]) == 1 else rows
-
-    @Value.setter
-    def Value(self, v):
-        for i, row in enumerate(v):
-            for j, x in enumerate(row):
-                if x is None:
-                    self.ws.cells.pop((self.r1 + i, self.c1 + j), None)
-                else:
-                    self.ws.cells[(self.r1 + i, self.c1 + j)] = x
-
-
-class _Cnt:
-    def __init__(self, n):
-        self.Count = n
-
-
-class _Font:
-    Size = 11
-
-
-class _Cell:
-    def __init__(self, ws, r, c):
-        self.ws, self.r, self.c = ws, r, c
-
-    @property
-    def Font(self):
-        return self.ws.fonts.setdefault((self.r, self.c), _Font())
-
-
-class _Sheet:
-    def __init__(self, name, cells):
-        self.Name, self.cells, self.fonts = name, cells, {}
-
-    class _Cells:
-        def __init__(s, ws): s.ws = ws
-        def __call__(s, r, c): return _Cell(s.ws, r, c)
-
-    @property
-    def Cells(self):
-        return _Sheet._Cells(self)
-
-    def Range(self, a, b):
-        return _Rng(self, a.r, a.c, b.r, b.c)
-
-    @property
-    def UsedRange(self):
-        rs = [k[0] for k in self.cells] or [1]
-        cs = [k[1] for k in self.cells] or [1]
-        class U:
-            Row, Column = min(rs), min(cs)
-            Rows, Columns = _Cnt(max(rs) - min(rs) + 1), _Cnt(max(cs) - min(cs) + 1)
-        return U
-
-
-class _Sheets:
-    def __init__(self, sheets): self.sheets = sheets
-    @property
-    def Count(self): return len(self.sheets)
-    def Item(self, i): return self.sheets[i - 1]
-    def __call__(self, name): return next(s for s in self.sheets if s.Name == name)
-
-
-class _Book:
-    def __init__(self, name, sheets): self.Name, self.Worksheets = name, _Sheets(sheets)
-    def Save(self): self.saved = True
-
-
-class _Books:
-    def __init__(self, books): self.books = books
-    @property
-    def Count(self): return len(self.books)
-    def __call__(self, key):
-        return self.books[key - 1] if isinstance(key, int) else next(b for b in self.books if b.Name == key)
-
-
-class _App:
-    def __init__(self, books):
-        self.Workbooks = _Books(books)
-        self.ActiveWorkbook = books[0]
-
-
+# (the instrumented fake lives in test_excel_fast.py and is shared)
 def test_com_backend_against_fake_excel_object_model(tmp_path):
-    src = openpyxl.load_workbook(make_pool_workbook(tmp_path / "src.xlsx"))
-    cells = {}
-    for ws_name in ("ENTRY PG1",):
-        for row in src[ws_name].iter_rows():
-            for c in row:
-                if c.value is not None:
-                    cells[(c.row, c.column)] = c.value if not str(c.value).startswith("=") else 0
-    book = _Book("JORNADA 10 PC.xlsx", [_Sheet("ENTRY PG1", cells), _Sheet("RESULTS", {(1, 1): "r"})])
-    other = _Book("OTHER.xlsx", [_Sheet("ENTRY PG1", {})])
-    app = _App([book, other])
+    app, sheet = pool_app(tmp_path)
+    cells = sheet.cells
+    app.Workbooks.books.append(FakeBook("OTHER.xlsx", [FakeSheet("ENTRY PG1", {}, app.meter)], app.meter))
     be = ComBackend(app=app)
     assert be.workbook_name == "JORNADA 10 PC.xlsx" and "live" in be.label
     sink = ExcelSink(be)
@@ -258,10 +163,10 @@ def test_com_backend_against_fake_excel_object_model(tmp_path):
     slot2 = sink.next_slot()
     rc = sink.write(slot2, "ANA", ["L", "", "E", "V", "V", "V", "V", "V", "V"])
     assert cells[(slot2.row, 16)] == "F1"
-    assert book.Worksheets("ENTRY PG1").fonts[(slot2.row, 16)].Size == 9
-    assert book.Worksheets("ENTRY PG1").fonts[(slot2.row, 15)].Size == 11        # normal cells keep their size
+    assert sheet.fonts[(slot2.row, 16)] == 9
+    assert sheet.fonts.get((slot2.row, 15), 11) == 11                    # normal cells keep their size
     sink.undo(rc)
-    assert (slot2.row, 16) not in cells and book.Worksheets("ENTRY PG1").fonts[(slot2.row, 16)].Size == 11
+    assert (slot2.row, 16) not in cells and sheet.fonts[(slot2.row, 16)] == 11
     assert ComBackend(workbook_hint="other", app=app).workbook_name == "OTHER.xlsx"
     with pytest.raises(ExcelError):
         ComBackend(workbook_hint="nope", app=app)

@@ -1,9 +1,13 @@
 """Keeps a permanent record of every slip that was entered: a straightened photo with the
-detected picks circled, plus one CSV row. Handy for settling any "that's not what I marked"."""
+detected picks circled, plus one CSV row. Handy for settling any "that's not what I marked".
+
+Also ``ScanLog`` (scanner.log): one line per entered slip with its timings - what to send when the
+app feels slow or something went wrong on the real PC."""
 from __future__ import annotations
 
 import csv
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -39,3 +43,32 @@ class AuditLog:
             return str(img_path)
         except OSError:
             return ""
+
+
+class ScanLog:
+    """Append-only text log, safe to call from any thread:  ``2026-10-15 12:00:01  ENTRY  ticket=251 read_ms=190 ...``"""
+
+    MAX_BYTES = 2_000_000                  # older lines move to scanner.log.1 once the file gets this big
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _fmt(v) -> str:
+        if isinstance(v, float):
+            v = round(v, 1)
+        s = str(v)
+        return f'"{s}"' if (not s or " " in s or '"' in s) else s
+
+    def line(self, event: str, /, **fields) -> None:
+        text = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {event}  " + \
+               " ".join(f"{k}={self._fmt(v)}" for k, v in fields.items() if v is not None)
+        with self._lock:
+            try:
+                if self.path.exists() and self.path.stat().st_size > self.MAX_BYTES:
+                    self.path.replace(self.path.with_name(self.path.name + ".1"))
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(text.replace("\n", " ") + "\n")
+            except OSError:
+                pass

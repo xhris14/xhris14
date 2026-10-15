@@ -79,7 +79,10 @@ def test_manual_flow_type_name_and_press_enter(env):
         assert [ws.cell(15, 15 + k).value for k in range(9)] == PICKS
         assert app.pending is None and app.ticket_var.get() == "252"
         assert len(app.tree.get_children()) == 1
+        assert app.sink.refresh_count == 1                           # committing no longer re-reads the whole workbook
+        app.flush_io()                                               # audit picture + CSV are written in the background
         assert (tmp / "scans" / "log.csv").exists()
+        assert "ENTRY" in (tmp / "scanner.log").read_text() and "ticket=251" in (tmp / "scanner.log").read_text()
         app.undo()
         assert openpyxl.load_workbook(xlsx)["ENTRY PG1"]["N15"].value is None
         assert app.ticket_var.get() == "251"
@@ -87,7 +90,8 @@ def test_manual_flow_type_name_and_press_enter(env):
         app.destroy()
 
 
-def test_auto_enter_when_claude_read_is_good_and_jornada_matches(env):
+def test_countdown_mode_auto_enters_when_claude_read_is_good_and_jornada_matches(env):
+    """auto_enter_delay_s > 0 keeps the old hands-on flow: wait for the name, count down, then write."""
     tmp, photo = env
     app, xlsx = make_app(tmp, photo, wbname="JORNADA 12 PC.xlsx", auto_enter_delay_s=0.5,
                          reader=FakeReader(NameResult("CLEMENTE O.", "12", True)))
@@ -97,6 +101,25 @@ def test_auto_enter_when_claude_read_is_good_and_jornada_matches(env):
         ws = openpyxl.load_workbook(xlsx)["ENTRY PG1"]
         assert ws["N15"].value == "CLEMENTE O. RRR"
         assert [ws.cell(15, 15 + k).value for k in range(9)] == PICKS
+    finally:
+        app.destroy()
+
+
+def test_defaults_are_stack_ready_and_picks_go_in_before_the_name(env):
+    """No countdown (auto_enter_delay_s = 0): the picks are in Excel at once, the name is filled in when read."""
+    assert (Config().auto_enter, Config().auto_enter_delay_s, Config().stable_frames) == (True, 0.0, 4)
+    tmp, photo = env
+    app, xlsx = make_app(tmp, photo, reader=FakeReader(NameResult("clemente o.", "12", True)))
+    try:
+        assert pump(app, lambda: len(app.entries) >= 1, 20), "fast mode never entered the slip"
+        job = app.entries[0]
+        assert job.state == "reading" and app.pending is None and not app.engine.paused
+        ws = openpyxl.load_workbook(xlsx)["ENTRY PG1"]
+        assert ws["N15"].value is None and [ws.cell(15, 15 + k).value for k in range(9)] == PICKS   # picks first ...
+        assert pump(app, lambda: job.state != "reading", 10)
+        ws = openpyxl.load_workbook(xlsx)["ENTRY PG1"]
+        assert ws["N15"].value == "CLEMENTE O."                                                      # ... name follows
+        assert app.sink.refresh_count == 1                                                           # no re-read per slip
     finally:
         app.destroy()
 

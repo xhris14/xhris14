@@ -354,6 +354,7 @@ class SlipReading:
     title_crop: np.ndarray                  # printed title strip, BGR
     grid: Grid
     candidates: list[tuple[str, ...]] = field(default_factory=list)   # letters that carry ink per row
+    ink_mask: np.ndarray | None = None      # _ink_mask(rectified), kept so fingerprint() need not recompute it
 
     @property
     def clean(self) -> bool:
@@ -424,7 +425,127 @@ def read_slip(frame: np.ndarray, n_rows: int = 9, settings: Settings | None = No
     y_title = int(max(g.title_bottom_y, 0.9 * g.row_h)) if g.title_bottom_y > 0 else int(g.row_h)
     title_crop = fin[0:max(10, y_title), :].copy()
     return SlipReading(picks=picks, verdicts=verdicts, ink=fractions, rectified=fin,
-                       name_crop=name_crop, title_crop=title_crop, grid=g, candidates=cands)
+                       name_crop=name_crop, title_crop=title_crop, grid=g, candidates=cands, ink_mask=ink)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4: "is this the same physical slip?"  (stack handling)
+# --------------------------------------------------------------------------- #
+# Slips of a stack share the identical printed form, so the fingerprint is made of pen ink
+# only: the L/E/V mark columns and the handwriting part of the name strip (never the printed
+# NOMBRE label, the rules, or the 'ULTIMO DIA...' line under the strip).
+_FP_MARKS = (104, 370)          # (w, h) of the mark raster: the mark columns at half the rectified size
+_FP_NAME = (388, 47)            # (w, h) of the handwriting raster (same scale)
+_FP_SHIFT = 3                   # +-px (raster) of registration slack between two photos
+_FP_DILATE = 1                  # px (raster) a stroke may be off and still count as the same stroke
+_FP_SPECK = 7                   # connected ink blobs smaller than this (raster px) are noise
+_FP_MIN_PX = 40                 # fewer ink pixels than this = nothing written there
+MARKS_SAME = 0.90               # min stroke coverage (both ways) for the marks of one slip
+NAME_SAME = 0.80                # ... and for its handwriting
+
+
+@dataclass(eq=False)
+class Fingerprint:
+    picks: tuple[str, ...]       # per row: the pick, or the letters that carry ink when there is no single pick
+    marks: np.ndarray = field(repr=False)    # binary (uint8) raster of the pen ink in the L/E/V columns
+    name: np.ndarray = field(repr=False)     # binary raster of the handwriting
+    marks_px: int
+    name_px: int
+
+    @property
+    def name_blank(self) -> bool:
+        return self.name_px < _FP_MIN_PX
+
+
+def _name_window(fin: np.ndarray, g: Grid) -> tuple[int, int, int, int]:
+    """(x0, x1, y0, y1) of the handwriting area in the rectified slip: right of the printed
+    NOMBRE label, under the last match row, above the strip's bottom rule."""
+    h, w = fin.shape[:2]
+    y0 = int(round(g.name_top_y + 0.08 * g.row_h))
+    y_max = int(round(g.name_top_y + 1.15 * g.row_h))
+    y_end = y_max
+    top = int(round(g.name_top_y + 0.5 * g.row_h))
+    if 0 <= top < h - 8:
+        dark = _dark_mask(cv2.cvtColor(fin[top:], cv2.COLOR_BGR2GRAY), 41, 14)
+        rules = _oriented_open(dark, max(15, int(0.25 * w)) | 1, 0.0, spread=3.0, step=1.5)
+        rows = np.nonzero(rules.sum(axis=1) > 0.25 * 255 * w)[0]
+        if rows.size:
+            y_rule = top + int(rows.max())
+            if g.name_top_y + 0.6 * g.row_h <= y_rule <= g.name_top_y + 1.5 * g.row_h:
+                y_end = min(y_max, y_rule - 2)
+    return int(0.2 * w), int(0.975 * w), y0, max(y0 + 4, y_end)
+
+
+def _raster(ink: np.ndarray, x0: int, x1: int, y0: int, y1: int, size: tuple[int, int],
+            full_h: int | None = None) -> np.ndarray:
+    """Cut ink[y0:y1, x0:x1] (zero padded to full_h rows), shrink to ``size`` -> binary uint8."""
+    h, w = ink.shape[:2]
+    x0, x1 = max(0, x0), min(w, x1)
+    crop = ink[max(0, y0):max(0, min(h, y1)), x0:x1]
+    if full_h is not None and crop.shape[0] < full_h:
+        crop = np.vstack([crop, np.zeros((full_h - crop.shape[0], crop.shape[1]), np.uint8)])
+    if crop.size == 0:
+        return np.zeros((size[1], size[0]), np.uint8)
+    small = (cv2.resize(crop, size, interpolation=cv2.INTER_AREA) > 80).astype(np.uint8)
+    _, lab, stats, _ = cv2.connectedComponentsWithStats(small, connectivity=8)
+    keep = stats[:, cv2.CC_STAT_AREA] >= _FP_SPECK          # tiny blobs are sensor noise or dust
+    keep[0] = False
+    return keep[lab].astype(np.uint8)
+
+
+def fingerprint(reading: SlipReading) -> Fingerprint:
+    """Pen-ink signature of a slip (see :func:`same_slip`). ~3 ms when ``reading.ink_mask`` is set."""
+    fin, g = reading.rectified, reading.grid
+    ink = reading.ink_mask if reading.ink_mask is not None else _ink_mask(fin)
+    c = g.corners
+    inset = 3
+    mx0, mx1 = int(round(float(c[:, 0, 0].mean()))) + inset, int(round(float(c[:, 3, 0].mean()))) - inset
+    my0, my1 = int(round(float(c[0, 0, 1]))) + inset, int(round(float(c[-1, 0, 1]))) - inset
+    marks = _raster(ink, mx0, mx1, my0, my1, _FP_MARKS)
+    nx0, nx1, ny0, ny1 = _name_window(fin, g)
+    full_h = int(round(1.15 * g.row_h - 0.08 * g.row_h))
+    name = _raster(ink, nx0, nx1, ny0, ny1, _FP_NAME, full_h)
+    cands = reading.candidates or [()] * len(reading.picks)
+    rows = tuple(p or "".join(c) for p, c in zip(reading.picks, cands))   # blank '' / double mark 'LV' stay distinct
+    return Fingerprint(rows, marks, name, int(marks.sum()), int(name.sum()))
+
+
+def _coverage(a: np.ndarray, b: np.ndarray) -> float:
+    """Best (over small shifts) of min(share of a's ink lying on b's strokes, share of b's on a's)."""
+    pad = _FP_SHIFT
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * _FP_DILATE + 1, 2 * _FP_DILATE + 1))
+    ad, bd = cv2.dilate(a, k), cv2.dilate(b, k)
+
+    def padded(m):
+        return cv2.copyMakeBorder(m, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0).astype(np.float32)
+    # c1[d] = sum a[x] * bd[x + d]  (a's ink explained by b);  c2[d] = sum ad[x] * b[x + d]  (b's ink by a)
+    c1 = cv2.matchTemplate(padded(bd), a.astype(np.float32), cv2.TM_CCORR)
+    c2 = cv2.matchTemplate(padded(b), ad.astype(np.float32), cv2.TM_CCORR)
+    best = np.minimum(c1 / max(float(a.sum()), 1.0), c2 / max(float(b.sum()), 1.0))
+    return float(best.max())
+
+
+def slip_similarity(a: Fingerprint, b: Fingerprint) -> tuple[float, float | None]:
+    """(marks score, handwriting score) in 0..1; the handwriting score is None when either
+    name strip is blank. Measured: one slip photographed again scores >= 0.93 (usually > 0.98),
+    another slip with identical picks <= 0.61 on the marks and <= 0.71 on the name."""
+    marks = _coverage(a.marks, b.marks) if a.marks_px >= _FP_MIN_PX and b.marks_px >= _FP_MIN_PX else \
+        (1.0 if a.marks_px < _FP_MIN_PX and b.marks_px < _FP_MIN_PX else 0.0)
+    name = None if (a.name_blank or b.name_blank) else _coverage(a.name, b.name)
+    return marks, name
+
+
+def same_slip(a: Fingerprint, b: Fingerprint) -> bool:
+    """True when two readings are the same physical slip (re-photographed, moved a little,
+    relit), False for a different slip - even one with identical picks."""
+    if a.picks != b.picks:
+        return False
+    if a.name_blank != b.name_blank:                    # someone wrote / nobody wrote a name
+        return False
+    if a.name_blank and a.marks_px < _FP_MIN_PX and b.marks_px < _FP_MIN_PX:
+        return False                                    # nothing written at all: cannot tell
+    marks, name = slip_similarity(a, b)
+    return marks >= MARKS_SAME and (name is None or name >= NAME_SAME)
 
 
 # --------------------------------------------------------------------------- #

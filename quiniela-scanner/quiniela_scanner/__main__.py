@@ -5,6 +5,8 @@
     python -m quiniela_scanner scan slip.jpg   read one photo and print the result (no Excel)
     python -m quiniela_scanner excel           show how the open workbook was understood
     python -m quiniela_scanner cameras         list webcams
+
+scanner.log (next to config.json) gets one line per entered slip with its timings.
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ def cmd_scan(args, cfg: Config) -> int:
         print("wrote", args.out)
     if args.name:
         from .name_reader import make_reader
-        reader, note = make_reader(True, cfg.claude_model)
+        reader, note = make_reader(True, cfg.claude_model, cfg.claude_effort)
         if reader is None:
             print("name:", note)
         else:
@@ -85,11 +87,11 @@ def main(argv=None) -> int:
 
     from .config import load_dotenv
     load_dotenv()
-    cfg = Config.load()
+    cfg = Config.load()                                   # an old config.json is migrated here (see config.py)
     if args.camera is not None:
         cfg.camera_index = args.camera
     if args.xlsx:
-        cfg.backend, cfg.workbook_path = "file", args.xlsx
+        cfg.override(backend="file", workbook_path=args.xlsx)        # this run only: never saved to config.json
 
     if args.cmd == "scan":
         return cmd_scan(args, cfg)

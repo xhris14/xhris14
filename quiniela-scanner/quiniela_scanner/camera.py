@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,6 +25,7 @@ class WebcamSource:
 
     def __init__(self, index: int = 0, width: int = 1920, height: int = 1080,
                  backend: str = "dshow", autofocus: bool = True, focus: int = 30):
+        self._lock = threading.Lock()            # cv2.VideoCapture is not thread-safe: read() vs the focus slider
         self.cap = cv2.VideoCapture(index, _api(backend))
         if not self.cap.isOpened():
             raise CameraError(f"cannot open camera {index} - is another app (Zoom, Teams, OBS) using it, "
@@ -41,20 +43,25 @@ class WebcamSource:
                      f"{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))})"
 
     def set_autofocus(self, on: bool, focus: int = 30):
-        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if on else 0)
-        if not on:
-            self.cap.set(cv2.CAP_PROP_FOCUS, focus)
+        """Autofocus on, or off with a fixed focus value (0-255; the C920s moves in steps of 5)."""
+        with self._lock:
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if on else 0)
+            if not on:
+                self.cap.set(cv2.CAP_PROP_FOCUS, int(focus))
 
     def open_driver_settings(self):
         """DirectShow driver dialog (exposure, focus, brightness...). Windows only."""
-        self.cap.set(cv2.CAP_PROP_SETTINGS, 1)
+        with self._lock:
+            self.cap.set(cv2.CAP_PROP_SETTINGS, 1)
 
     def read(self):
-        ok, frame = self.cap.read()
+        with self._lock:
+            ok, frame = self.cap.read()
         return frame if ok else None
 
     def close(self):
-        self.cap.release()
+        with self._lock:
+            self.cap.release()
 
 
 class ImageSource:
@@ -87,6 +94,61 @@ class ImageSource:
 
     def close(self):
         pass
+
+
+class FrameGrabber:
+    """Reads ``source`` in its own thread and keeps only the newest frame.
+
+    A consumer that is busy for a moment (reading a slip takes ~200 ms) then never works through a
+    backlog of stale frames, and the driver queue cannot back up. ``get`` hands out each frame once."""
+
+    def __init__(self, source):
+        self.source = source
+        self._cv = threading.Condition()
+        self._frame = None
+        self._id = 0
+        self._t = time.monotonic()
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name="grabber", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stopped:
+            try:
+                frame = self.source.read()
+            except Exception:
+                frame = None
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            with self._cv:
+                self._frame, self._id, self._t = frame, self._id + 1, time.monotonic()
+                self._cv.notify_all()
+
+    def get(self, after: int = 0, timeout: float = 0.5):
+        """(id, frame) of the newest frame if it is newer than ``after``; waits up to ``timeout`` s for one,
+        else (after, None)."""
+        end = time.monotonic() + timeout
+        with self._cv:
+            while self._id <= after and not self._stopped:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                self._cv.wait(left)
+            if self._id > after and self._frame is not None:
+                return self._id, self._frame
+        return after, None
+
+    def age(self) -> float:
+        """Seconds since the last frame arrived."""
+        return time.monotonic() - self._t
+
+    def stop(self):
+        self._stopped = True
+        with self._cv:
+            self._cv.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(1.0)
 
 
 def list_cameras(max_index: int = 5, backend: str = "dshow") -> list:

@@ -5,3 +5,5 @@ __pycache__/
 config.json
 .env
 scans/
+scanner.log
+scanner.log.1

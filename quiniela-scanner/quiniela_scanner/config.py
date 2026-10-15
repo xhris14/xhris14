@@ -7,6 +7,10 @@ import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+CONFIG_VERSION = 2
+# Builds before version 2 saved every setting, so these three would pin the old (slow, hands-on) defaults forever.
+RESET_ON_UPGRADE = ("stable_frames", "auto_enter_delay_s", "auto_enter")
+
 
 def app_dir() -> Path:
     """Folder that holds config.json, scans/ and the log (the exe folder when frozen)."""
@@ -17,6 +21,8 @@ def app_dir() -> Path:
 
 @dataclass
 class Config:
+    config_version: int = CONFIG_VERSION
+
     # --- camera -----------------------------------------------------------
     camera_index: int = 0
     camera_backend: str = "dshow"        # dshow | msmf | auto  (dshow is best for the C920s)
@@ -44,6 +50,10 @@ class Config:
     # --- name reading -----------------------------------------------------
     read_names_with_claude: bool = True  # needs ANTHROPIC_API_KEY; otherwise you type the name
     claude_model: str = "claude-opus-5-5"
+    claude_effort: str = "low"           # output_config effort sent with every name request
+    name_workers: int = 6                # name reads in flight at once (they run in the background)
+    name_timeout_s: float = 45.0         # give up on a name still not back after this long -> "?" + review
+    unsure_marker: str = " ?"            # appended to a name Claude was not sure of ("" = no marker)
 
     # --- empty boxes ------------------------------------------------------
     blank_marker: str = "F1"             # written in a pick box the player left empty ("" = leave the cell empty)
@@ -53,10 +63,21 @@ class Config:
 
     # --- behaviour --------------------------------------------------------
     auto_enter: bool = True              # write clean scans without a click
-    auto_enter_delay_s: float = 3.0      # review window before an automatic write (0 = instant)
-    stable_frames: int = 7               # frames the slip must sit still before capture
+    auto_enter_delay_s: float = 0.0      # > 0: old hands-on mode - wait for the name, then count down (0 = instant)
+    stable_frames: int = 4               # frames the slip must sit still before capture
+    sounds: bool = True                  # short beeps: slip entered / needs you (Windows only)
     min_ink: float = 0.015               # mark detection thresholds (see slip_vision.Settings)
     multi_ratio: float = 0.45
+
+    def __post_init__(self):
+        self.migrated: list = []         # settings of an older config.json that were reset (not saved)
+        self._session: dict = {}         # command-line overrides: name -> the value to keep in config.json
+
+    def override(self, **values) -> None:
+        """Use these values for this run only (command-line flags such as --xlsx must not end up in config.json)."""
+        for k, v in values.items():
+            self._session.setdefault(k, getattr(self, k))
+            setattr(self, k, v)
 
     # ----------------------------------------------------------------------
     @classmethod
@@ -67,21 +88,47 @@ class Config:
     def load(cls, path: Path | None = None) -> "Config":
         path = path or cls.path()
         cfg = cls()
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                return cfg
-            known = {f.name for f in fields(cls)}
-            for k, v in data.items():
-                if k in known:
-                    setattr(cfg, k, v)
+        if not path.exists():
+            return cfg
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return cfg
+        if not isinstance(data, dict):
+            return cfg
+        version = data.get("config_version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < CONFIG_VERSION:
+            cfg.migrated = [k for k in RESET_ON_UPGRADE if k in data]
+            data = {k: v for k, v in data.items() if k not in RESET_ON_UPGRADE}
+        default = cls()
+        for f in fields(cls):
+            if f.name == "config_version" or f.name not in data:
+                continue
+            v, d = data[f.name], getattr(default, f.name)
+            if isinstance(d, bool):
+                ok = isinstance(v, bool)
+            elif isinstance(d, int):
+                ok = isinstance(v, int) and not isinstance(v, bool)
+            elif isinstance(d, float):
+                ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+                v = float(v) if ok else v
+            else:
+                ok = isinstance(v, type(d))
+            if ok:
+                setattr(cfg, f.name, v)
         return cfg
 
     def save(self, path: Path | None = None) -> None:
+        """Write only what differs from the defaults (so new defaults reach everybody) plus config_version."""
         path = path or self.path()
+        default = asdict(Config())
+        data = {"config_version": CONFIG_VERSION}
+        data.update({k: v for k, v in {**asdict(self), **self._session}.items()
+                     if k != "config_version" and v != default[k]})
         try:
-            path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
         except OSError:
             pass
 
