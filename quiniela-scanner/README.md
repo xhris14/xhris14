@@ -258,8 +258,9 @@ reader's failure paths; and the failure cases found in review: several slips que
 flight, a failing name reader, a locked `log.csv`, config files in other encodings, small screens, keys typed in entries.
 
 **Not tested on real hardware** - there was no Windows PC, webcam, Excel or API key in the build environment: the live **C920s**
-(autofocus hunting, exposure changes after a hand passes, the focus slider), the **Excel COM connection** (verified only against a
-stand-in; real Excel's speed, a cell in edit mode, `ScreenUpdating`), the **live Claude name read** (request shape verified against a
+(autofocus hunting, exposure changes after a hand passes, the focus slider), the **Excel COM writing** (the connection and layout reading were
+checked on your real workbook with `run.bat excel`; the row writes were verified only against a stand-in - real Excel's speed, a cell in
+edit mode, `ScreenUpdating`), the **live Claude name read** (request shape verified against a
 mock, latency unknown) and the **beeps**. Known blind spot: a slip swapped so fast that no hand or movement is ever seen (e.g. during the
 ~0.2 s it takes to read one) is not noticed - the app then simply does not enter the new slip; lift it again or press Capture now.
 Do a first run on a *copy* of your workbook.
