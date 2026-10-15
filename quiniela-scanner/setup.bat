@@ -2,17 +2,25 @@
 rem One-time setup: creates a private Python environment and installs what the scanner needs.
 cd /d "%~dp0"
 
+rem Prefer a well-supported Python (3.12, then 3.13, 3.11, 3.10); fall back to whatever is newest.
 set PY=
-py -3 --version >nul 2>nul
-if not errorlevel 1 set PY=py -3
+for %%V in (3.12 3.13 3.11 3.10) do (
+  if not defined PY (
+    py -%%V --version >nul 2>nul
+    if not errorlevel 1 set PY=py -%%V
+  )
+)
+if not defined PY (
+  py -3 --version >nul 2>nul
+  if not errorlevel 1 set PY=py -3
+)
 if not defined PY (
   python --version >nul 2>nul
   if not errorlevel 1 set PY=python
 )
 if not defined PY (
   echo Python was not found.
-  echo Install Python 3.12 or 3.13 from https://www.python.org/downloads/ then run this file again.
-  echo If the installer shows an Add python.exe to PATH box, tick it.
+  echo Install Python 3.12 from https://www.python.org/downloads/ then run this file again.
   pause
   exit /b 1
 )
