@@ -83,7 +83,7 @@ row type the letters (one letter is fine), choose **Before name** or **After nam
 ### 4b. Empty boxes become `F1`
 
 If a player leaves a match unmarked, that pick cell is filled with **`F1` in font size 9** (the rest of the row keeps its normal
-font). On the card the row shows `empty = F1`, and the "Will be written" picks use `F1` too.
+font). On the card the row shows `empty = F1`, and the history list shows `F1` for it.
 
 * A slip with 1–2 empty boxes still auto-enters. **3 or more empty boxes wait for you** (that usually means the camera missed
   something, e.g. a blank or badly lit slip). Change this with `auto_enter_max_blank`, or set `auto_enter_blanks` to `false` to
