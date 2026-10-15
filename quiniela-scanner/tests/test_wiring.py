@@ -525,7 +525,7 @@ def test_a_full_block_holds_the_slip_names_the_next_block_and_waits_for_enter(en
     inject(app, reader, readings[0], good("A0"))               # takes the last ticket (292)
     assert entered(app, 1) and app.entries[0].ticket == 292
     assert "FULL" in app.low_note and str(app.block_lbl.cget("foreground")) == gui.BAD
-    assert "This block is now FULL" in app._entered_msg
+    assert "This block is now FULL" in app.stats_var.get()      # (the status line is cleared as soon as the camera sees no slip)
     inject(app, reader, readings[1], good("A1"))               # ... and this one does not fit
     assert pump(app, lambda: app.pending is not None)
     assert app.pending.hold and not app.entries[1:] and len(app.entries) == 1
