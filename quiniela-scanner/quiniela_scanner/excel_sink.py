@@ -58,6 +58,25 @@ def needs_text_prefix(s: str) -> bool:
     return bool(_FORMULA_OR_NUMBERISH.match(s))
 
 
+def format_name(name: str, tag: str = "", position: str = "after", sep: str = " ",
+                uppercase: bool = True) -> str:
+    """Tidy the name and add the group tag before or after it.
+
+    The tag is skipped only if the slip already carries it as a separate word at that end
+    (so a tag of "E" is still added to "JOSE" or "ELENA")."""
+    name = " ".join(name.split())
+    tag = tag.strip()
+    if uppercase:
+        name, tag = name.upper(), tag.upper()
+    if not tag or not name:
+        return name
+    words = name.split(" ")
+    edge = words[0] if position == "before" else words[-1]
+    if edge.upper() == tag.upper():
+        return name
+    return f"{tag}{sep}{name}" if position == "before" else f"{name}{sep}{tag}"
+
+
 class ExcelError(Exception):
     pass
 
@@ -399,14 +418,8 @@ class ExcelSink:
         return slot_is_free(self.snaps[slot.block.sheet], slot.block, slot.row)
 
     # -- writing -----------------------------------------------------------
-    def format_name(self, name: str, suffix: str = "") -> str:
-        name = " ".join(name.split())
-        if self.uppercase:
-            name = name.upper()
-        suffix = suffix.strip()
-        if suffix and not name.upper().endswith(suffix.upper()):
-            name = f"{name} {suffix}"
-        return name
+    def format_name(self, name: str, tag: str = "", position: str = "after", sep: str = " ") -> str:
+        return format_name(name, tag, position, sep, self.uppercase)
 
     def write(self, slot: Slot, name: str, picks: list, allow_overwrite: bool = False) -> Receipt:
         b = slot.block

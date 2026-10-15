@@ -79,10 +79,23 @@ def test_name_never_becomes_formula_or_date(sink):
     assert needs_text_prefix("1-2-3") and needs_text_prefix("=SUM(A1)") and not needs_text_prefix("1-2-3 RRR")
 
 
-def test_format_name_uppercases_and_appends_suffix_once(sink):
+def test_format_name_tag_after_before_and_off(sink):
     s, _ = sink
-    assert s.format_name("clemente  o.", "RRR") == "CLEMENTE O. RRR"
-    assert s.format_name("TONY 5000 RRR", "RRR") == "TONY 5000 RRR"
+    assert s.format_name("clemente  o.") == "CLEMENTE O."                          # no tag
+    assert s.format_name("clemente  o.", "rrr") == "CLEMENTE O. RRR"                # default: after
+    assert s.format_name("clemente o.", "rrr", "before") == "RRR CLEMENTE O."
+    assert s.format_name("ana", "E", "before", sep="-") == "E-ANA"
+
+
+def test_tag_is_not_doubled_but_single_letters_are_not_confused_with_name_letters(sink):
+    s, _ = sink
+    assert s.format_name("TONY 5000 RRR", "RRR") == "TONY 5000 RRR"                 # slip already has it
+    assert s.format_name("RRR TONY", "RRR", "before") == "RRR TONY"
+    assert s.format_name("TONY RRR", "RRR", "before") == "RRR TONY RRR"             # other end: add it
+    # "E" is a letter OF these names, not a separate tag word -> must still be added
+    assert s.format_name("JOSE", "E") == "JOSE E"
+    assert s.format_name("ELENA", "E", "before") == "E ELENA"
+    assert s.format_name("ANA E", "E") == "ANA E"                                   # already tagged
 
 
 def test_full_block_is_reported(tmp_path):

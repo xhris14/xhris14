@@ -19,7 +19,7 @@ from .audit import AuditLog
 from .camera import CameraError, WebcamSource
 from .capture import CaptureEngine, Update
 from .config import Config, app_dir
-from .excel_sink import ExcelError, ExcelSink, SlotTaken, open_backend
+from .excel_sink import ExcelError, ExcelSink, SlotTaken, format_name, open_backend
 from .name_reader import NameResult, make_reader
 
 FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
@@ -79,6 +79,7 @@ class App(tk.Tk):
         self._build()
         self.bind_all("<Return>", lambda e: self.commit())
         self.bind_all("<Escape>", lambda e: self.escape())
+        self.bind_all("<F2>", lambda e: self.tag_on.set(not self.tag_on.get()))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.connect_excel()
         self.start_camera()
@@ -120,11 +121,26 @@ class App(tk.Tk):
         ticket_entry = ttk.Entry(tgt, textvariable=self.ticket_var, width=7, font=(FONT, 12, "bold"))
         ticket_entry.grid(row=0, column=3, **pad)
         ticket_entry.bind("<Key>", self.on_ticket_key)
-        ttk.Label(tgt, text="Name suffix:").grid(row=0, column=4, **pad)
-        self.suffix_var = tk.StringVar(value=self.cfg.name_suffix)
-        ttk.Entry(tgt, textvariable=self.suffix_var, width=8).grid(row=0, column=5, **pad)
         self.auto_var = tk.BooleanVar(value=self.cfg.auto_enter)
-        ttk.Checkbutton(tgt, text="Auto-enter clean scans", variable=self.auto_var).grid(row=0, column=6, padx=14)
+        ttk.Checkbutton(tgt, text="Auto-enter clean scans", variable=self.auto_var).grid(row=0, column=4, padx=14)
+
+        # group tag: letters like "RRR" or "E" added before/after every name, switched on/off as you go
+        ttk.Label(tgt, text="Group tag:").grid(row=1, column=0, **pad)
+        tagrow = ttk.Frame(tgt)
+        tagrow.grid(row=1, column=1, columnspan=4, sticky="w", **pad)
+        self.tag_var = tk.StringVar(value=self.cfg.name_tag)
+        self.tag_pos = tk.StringVar(value=self.cfg.name_tag_position if self.cfg.name_tag_position in
+                                    ("before", "after") else "after")
+        self.tag_on = tk.BooleanVar(value=False)          # always starts OFF so nobody is tagged by accident
+        ttk.Entry(tagrow, textvariable=self.tag_var, width=8, font=(FONT, 12, "bold")).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(tagrow, text="Before name", value="before", variable=self.tag_pos).pack(side="left", padx=2)
+        ttk.Radiobutton(tagrow, text="After name", value="after", variable=self.tag_pos).pack(side="left", padx=2)
+        ttk.Checkbutton(tagrow, text="Add tag  (F2)", variable=self.tag_on).pack(side="left", padx=14)
+        self.tag_state = tk.StringVar()
+        self.tag_state_lbl = ttk.Label(tagrow, textvariable=self.tag_state, font=(FONT, 11, "bold"))
+        self.tag_state_lbl.pack(side="left", padx=6)
+        for v in (self.tag_var, self.tag_pos, self.tag_on):
+            v.trace_add("write", lambda *a: self.on_tag_change())
 
         # ----- main: preview | card
         main = ttk.Frame(self)
@@ -146,22 +162,26 @@ class App(tk.Tk):
         card = ttk.LabelFrame(main, text="Scanned slip", style="Card.TLabelframe")
         card.pack(side="left", fill="both", expand=True, padx=8)
         self.slip_img = ttk.Label(card)
-        self.slip_img.grid(row=0, column=0, rowspan=4, sticky="n", **pad)
+        self.slip_img.grid(row=0, column=0, rowspan=5, sticky="n", **pad)
         self.name_img = ttk.Label(card)
         self.name_img.grid(row=0, column=1, columnspan=2, sticky="w", **pad)
         ttk.Label(card, text="Name:", font=(FONT, 11, "bold")).grid(row=1, column=1, sticky="e")
         self.name_var = tk.StringVar()
+        self.name_var.trace_add("write", lambda *a: self.update_final())
         self.name_entry = ttk.Entry(card, textvariable=self.name_var, font=(FONT, 16, "bold"), width=17)
         self.name_entry.grid(row=1, column=2, sticky="w", **pad)
         self.name_entry.bind("<Key>", self.on_name_key)
         self.name_note = tk.StringVar()
         ttk.Label(card, textvariable=self.name_note, wraplength=300).grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+        self.final_var = tk.StringVar()
+        ttk.Label(card, textvariable=self.final_var, font=(FONT, 11, "bold"), foreground="#0b5394",
+                  wraplength=300).grid(row=3, column=1, columnspan=2, sticky="w", padx=6, pady=2)
         self.jor_note = tk.StringVar()
         self.jor_lbl = ttk.Label(card, textvariable=self.jor_note, wraplength=300)
-        self.jor_lbl.grid(row=3, column=1, columnspan=2, sticky="w", padx=6)
+        self.jor_lbl.grid(row=4, column=1, columnspan=2, sticky="w", padx=6)
 
         grid = ttk.Frame(card)
-        grid.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        grid.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
         self.pick_vars, self.pick_lbls = [], []
         for i in range(self.cfg.matches_per_slip):
             col = (i // 5) * 6
@@ -179,13 +199,13 @@ class App(tk.Tk):
             self.pick_lbls[i] = (lbl, note)
 
         btns = ttk.Frame(card)
-        btns.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+        btns.grid(row=6, column=0, columnspan=3, sticky="w", **pad)
         self.write_btn = ttk.Button(btns, text="Write to Excel  (Enter)", style="Big.TButton", command=self.commit)
         self.write_btn.pack(side="left", padx=4)
         ttk.Button(btns, text="Discard  (Esc)", command=self.discard).pack(side="left", padx=4)
         self.auto_var_txt = tk.StringVar()
         ttk.Label(card, textvariable=self.auto_var_txt, font=(FONT, 11, "bold"), foreground=GOOD).grid(
-            row=6, column=0, columnspan=3, sticky="w", padx=8)
+            row=7, column=0, columnspan=3, sticky="w", padx=8)
 
         # ----- history
         hist = ttk.LabelFrame(self, text="Entered this session")
@@ -199,6 +219,7 @@ class App(tk.Tk):
         self.tree.pack(side="left", fill="x", expand=True)
         ttk.Button(hist, text="Undo last", command=self.undo).pack(side="left", padx=8)
         self.clear_card()
+        self.on_tag_change()
 
     # ----------------------------------------------------------- camera
     def start_camera(self):
@@ -281,20 +302,18 @@ class App(tk.Tk):
         if chosen is None:
             chosen = self.sink.default_block()
         if chosen:
-            self.select_info(chosen, reset_suffix=select_default)
+            self.select_info(chosen)
 
     def on_ticket_key(self, e):
         if e.keysym not in ("Return", "Escape", "Tab"):
             self.ticket_custom = True
 
-    def select_info(self, info, reset_suffix=False):
+    def select_info(self, info):
         self.ticket_custom = False
         self.sel_key = info.block.key
         self.block_var.set(info.label)
         slot = info.first_free
         self.ticket_var.set(str(slot.ticket) if slot and slot.ticket is not None else "")
-        if reset_suffix:
-            self.suffix_var.set(self.cfg.name_suffix or info.suffix)
 
     def selected_info(self):
         return next((i for i in self.infos if i.block.key == self.sel_key), None)
@@ -302,8 +321,7 @@ class App(tk.Tk):
     def on_block_change(self):
         info = next((i for i in self.infos if i.label == self.block_var.get()), None)
         if info:
-            self.cfg.name_suffix = ""          # a block change re-derives the suffix from that block
-            self.select_info(info, reset_suffix=True)
+            self.select_info(info)
 
     def expected_jornada(self) -> str:
         if self.cfg.expected_jornada:
@@ -397,6 +415,36 @@ class App(tk.Tk):
             self.jor_note.set(f"Slip: JORNADA {res.jornada}")
             self.jor_lbl.configure(foreground=GOOD)
 
+    def active_tag(self) -> str:
+        return self.tag_var.get().strip() if self.tag_on.get() else ""
+
+    def final_name(self, name: str) -> str:
+        return format_name(name, self.active_tag(), self.tag_pos.get(), self.cfg.tag_separator,
+                           self.cfg.uppercase_names)
+
+    def update_final(self):
+        name = self.name_var.get().strip()
+        if not name:
+            self.final_var.set("")
+            return
+        self.final_var.set("Will be written as:  " + self.final_name(name))
+
+    def on_tag_change(self):
+        tag, on = self.tag_var.get().strip(), self.tag_on.get()
+        if on and tag:
+            where = "before" if self.tag_pos.get() == "before" else "after"
+            self.tag_state.set(f"TAG ON: \"{tag.upper() if self.cfg.uppercase_names else tag}\" {where} name")
+            self.tag_state_lbl.configure(foreground=GOOD)
+        elif on:
+            self.tag_state.set("TAG ON but empty - type the letters")
+            self.tag_state_lbl.configure(foreground=WARN)
+        else:
+            self.tag_state.set("tag off")
+            self.tag_state_lbl.configure(foreground="#777")
+        self.update_final()
+        if self.pending is not None:
+            self.touch()                       # changing the tag mid-slip: confirm with Enter, don't auto-write
+
     def on_name_key(self, e):
         if e.keysym in ("Return", "Escape", "Tab") or e.keysym.startswith(("Shift", "Control", "Alt", "Caps")):
             return
@@ -470,7 +518,7 @@ class App(tk.Tk):
             messagebox.showerror("Ticket", "That ticket number is not in the selected sheet, "
                                            "or the block has no free row left.")
             return
-        final_name = self.sink.format_name(name, self.suffix_var.get())
+        final_name = self.final_name(name)
         try:
             try:
                 receipt = self.sink.write(slot, final_name, picks)
@@ -562,7 +610,8 @@ class App(tk.Tk):
         super().destroy()
 
     def on_close(self):
-        self.cfg.name_suffix = self.suffix_var.get()
+        self.cfg.name_tag = self.tag_var.get().strip()
+        self.cfg.name_tag_position = self.tag_pos.get()
         self.cfg.auto_enter = self.auto_var.get()
         self.cfg.autofocus = self.af_var.get()
         self.cfg.save()

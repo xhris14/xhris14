@@ -45,8 +45,7 @@ Nothing is hard-coded to column letters. On every sheet named `ENTRY*` it looks 
 * It writes **name + picks 1–9 only**. `T` and everything else is left alone.
 * Target = the **first free ticket** (empty name and empty picks) in the selected block. Type a **Ticket #** to override.
   It re-reads Excel just before every write, so rows you typed by hand in the meantime are never overwritten.
-* **Name suffix**: if the names in a block share a trailing code (your `RRR` / `CH` blocks) the app suggests it and appends
-  it to every name it writes. Clear the box if you don't want it.
+* **Group tag**: see §4a.
 * After opening a different workbook (next jornada), press **Connect / reconnect Excel**. The app stays bound to the
   workbook it connected to, so switching windows in Excel can't redirect a write.
 * It uses Excel's own object model, so the file can stay open, AutoSave keeps working, and nothing is overwritten
@@ -66,6 +65,20 @@ Auto-enter only fires when *all* of these hold; otherwise it waits for you:
 * Claude read the name confidently (if you type or fix a name yourself, press **Enter** to write it), and the slip's jornada matches the workbook's
   (`JORNADA 10 PC.xlsx` → 10; a slip printed "JORNADA 12" is flagged),
 * the target ticket exists and is free.
+
+### 4a. Group tags (`RRR`, `E`, …)
+
+Some neighbourhoods/groups add a letter code so they can find themselves on the printed sheet. In the **Group tag**
+row type the letters (one letter is fine), choose **Before name** or **After name**, and tick **Add tag (F2)**:
+
+* While the tag is **on**, the green line says `TAG ON: "RRR" after name`, and the card shows exactly what will be
+  written (`Will be written as: CLEMENTE O. RRR`).
+* Next person has no group? Press **F2** (or untick the box). The tag is added to nothing until you switch it on again.
+* The switch **always starts OFF** when you open the app, so no one is tagged by accident. The letters and the
+  before/after choice are remembered.
+* If you switch the tag or change it while a slip is on screen, that slip waits for **Enter** instead of auto-entering.
+* If the slip already has the tag as its own word at that end (`TONY 5000 RRR`) it is not added twice. A tag of `E`
+  is still added to `JOSE` or `ELENA`, because those are letters inside a name, not a tag.
 
 A row left blank on the slip stays blank in Excel (your "F1" rule is yours to apply). **`scans/`** keeps a picture of every
 entered slip plus `log.csv`, so any dispute can be checked against what the camera saw.
@@ -88,7 +101,8 @@ goes in; Claude flags names it is unsure about and those never auto-enter.
 | `workbook` | blank = the workbook active in Excel at connect time, or part of a file name |
 | `sheets` | sheet-name patterns to search (`["ENTRY*"]`) |
 | `name_header` | header text above the names (`NOMBRE`) |
-| `name_suffix`, `uppercase_names` | added to / applied to every name |
+| `name_tag`, `name_tag_position`, `tag_separator` | remembered group-tag letters, `before` / `after`, and what goes between tag and name (default one space) |
+| `uppercase_names` | write names in capitals |
 | `auto_enter`, `auto_enter_delay_s` | hands-free entry and the cancel window |
 | `save_after_write` | also press Save in Excel after each ticket (AutoSave normally covers this) |
 | `expected_jornada` | blank = take it from the workbook name |
@@ -118,7 +132,7 @@ run.bat cameras                  list webcams
 
 ## 9. What was tested, and what was not
 
-Tested (automated, 40 tests): the slip reader on your real photo (all 9 marks, row for row) and on 13 degraded
+Tested (automated, 43 tests): the slip reader on your real photo (all 9 marks, row for row) and on 13 degraded
 versions of it (small, rotated ±25°, upside-down, blurred, noisy, dark, no blue pen, perspective); empty/unrelated pictures are
 rejected; the capture logic (waits for stillness, reads once, needs the slip removed); Excel block discovery, free-ticket
 choice, writing, undo, formula-safe names – against a workbook laid out like your screenshot; and the real window driven end to

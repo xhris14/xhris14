@@ -35,7 +35,9 @@ class Config:
     sheets: list = field(default_factory=lambda: ["ENTRY*"])
     name_header: str = "NOMBRE"          # header text that marks the name column of each ticket block
     uppercase_names: bool = True
-    name_suffix: str = ""                # e.g. "RRR": appended to every name written
+    name_tag: str = ""                   # group tag such as "RRR" or "E" (remembered; the on/off switch always starts OFF)
+    name_tag_position: str = "after"     # "before" or "after" the name
+    tag_separator: str = " "             # put between tag and name
     save_after_write: bool = False       # Excel AutoSave normally handles this
     expected_jornada: str = ""           # "" = read it from the workbook name ("JORNADA 10 PC" -> 10)
 
