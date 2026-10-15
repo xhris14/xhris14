@@ -39,6 +39,12 @@ class WebcamSource:
         self.set_autofocus(autofocus, focus)
         for _ in range(5):          # let exposure settle
             self.cap.read()
+        # what the driver says it will deliver (0 = unknown). In dim light a C920s drops to 10-15 fps on its own
+        # (Low Light Compensation / RightLight); FrameGrabber.fps() measures what really arrives.
+        try:
+            self.fps_reported = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except (cv2.error, TypeError, ValueError):
+            self.fps_reported = 0.0
         self.label = f"camera {index} ({int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x" \
                      f"{int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))})"
 
@@ -102,12 +108,18 @@ class FrameGrabber:
     A consumer that is busy for a moment (reading a slip takes ~200 ms) then never works through a
     backlog of stale frames, and the driver queue cannot back up. ``get`` hands out each frame once."""
 
+    FPS_ALPHA = 0.1             # weight of the newest gap in the moving average
+    FPS_MIN_GAPS = 20
+    MAX_GAP_S = 0.5
+
     def __init__(self, source):
         self.source = source
         self._cv = threading.Condition()
         self._frame = None
         self._id = 0
         self._t = time.monotonic()
+        self._gap = 0.0                 # moving average of the seconds between two frames
+        self._gaps = 0                  # ... made from this many
         self._stopped = False
         self._thread = threading.Thread(target=self._run, name="grabber", daemon=True)
         self._thread.start()
@@ -121,8 +133,13 @@ class FrameGrabber:
             if frame is None:
                 time.sleep(0.05)
                 continue
+            now = time.monotonic()
             with self._cv:
-                self._frame, self._id, self._t = frame, self._id + 1, time.monotonic()
+                gap = now - self._t
+                if self._id and 0 < gap < self.MAX_GAP_S:        # (a longer gap is a stall or an unplugged camera, not a rate)
+                    self._gap = gap if not self._gaps else self._gap + self.FPS_ALPHA * (gap - self._gap)
+                    self._gaps += 1
+                self._frame, self._id, self._t = frame, self._id + 1, now
                 self._cv.notify_all()
 
     def get(self, after: int = 0, timeout: float = 0.5):
@@ -142,6 +159,13 @@ class FrameGrabber:
     def age(self) -> float:
         """Seconds since the last frame arrived."""
         return time.monotonic() - self._t
+
+    def fps(self) -> float:
+        """Frames per second that really arrive (moving average of the gaps between frames); 0.0 until about
+        FPS_MIN_GAPS gaps have been seen. A slow camera (dim light, Low Light Compensation) is what makes the
+        lift of a slip fall between two pictures."""
+        with self._cv:
+            return 1.0 / self._gap if self._gaps >= self.FPS_MIN_GAPS and self._gap > 0 else 0.0
 
     def stop(self):
         self._stopped = True

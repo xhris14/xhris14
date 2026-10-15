@@ -13,7 +13,10 @@ stays TRACKING and says "Take your hand off the slip" (after ``hand_timeout_s`` 
 rows under the hand flagged OCCLUDED, so the stack cannot stall silently).  And while it waits
 for the lift it now and then re-checks that what lies there is still the slip it entered
 (``_verify``): the lift of a slip is easy to miss at a low frame rate or while a read is
-running, and the next slip, lying in the same place, would never be read.
+running, and the next slip, lying in the same place, would never be read.  That re-check needs two
+looks that agree and differ from every slip entered lately, and it only counts while the picture is
+as sharp, as quiet and as colour-true as when the slip was read (a blur, a burst of noise or a colour
+cast make the ink of one slip look like another's).
 """
 from __future__ import annotations
 
@@ -80,6 +83,10 @@ class CaptureEngine:
     POLL_AFTER_DUP_S = 0.15  # ... and the first one after a re-read that found the same slip: the lift may just have gone by
     POLL_CALM = 2            # frames in a row without a real disturbance (a hand, a moving slip) needed before a look
     POLL_AGREE = 0.7         # the two looks at a new slip must agree this well (the same slip, measured twice: ~1.0)
+    POLL_DEFER_S = 0.25      # a look is put off this long when the picture is not fit to tell slips apart (see _verify)
+    CRISP_KEEP = 0.5         # ... because it is blurred (less than this share of the sharpness it had when the slip was read), noisy,
+    TINT_KEEP = 0.1          # ... or its white balance moved by more than this share
+    BAD_ROWS = 5             # ... or because its read leaves this many rows unclear (multiple, weak, heavy, hidden): garbage, not a slip
 
     def __init__(self, n_rows: int = 9, stable_frames: int = 4, settings: sv.Settings | None = None, *,
                  wait_focus: bool = True, focus_cap_frames: int = 12, focus_cap_s: float = 0.4,
@@ -135,6 +142,7 @@ class CaptureEngine:
             self._hand_seen = False              # ... and a real read (not just the cheap look) has confirmed it
             self._holding = False                # the last look found a hand: say so while waiting for the next
             self._base = None                    # (fingerprint, grid, alignment template) of the slip lying there since the last read
+            self._base_q = (0.0, 0.0, np.ones(2, np.float32))   # ... and the (sharpness, noise, tint) of its picture (see _fit)
             self._cand = None                    # a fingerprint that differed from _base: waiting for a second look
             self._poll_at = None
             self._polls = 0
@@ -213,6 +221,31 @@ class CaptureEngine:
         gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(gray, cv2.CV_16S).var()) / max(float(cv2.mean(gray)[0]), 1.0) ** 2
 
+    @staticmethod
+    def _quality(frame: np.ndarray, roi) -> tuple[float, float, np.ndarray]:
+        """(sharpness, noise, tint) of the slip's picture, for _verify. Sharpness: Laplacian variance of the half-size grey
+        crop over brightness squared (the halving keeps sensor noise from hiding a blur: a blur of 1.5 px leaves 0.12-0.22
+        of it, sensor noise 0-10 grey levels, gain 0.5-1; the same picture again varies by < 2%). Noise: grey levels, median
+        deviation from a 3x3 mean (~0.7 x the sensor's sigma; the flat paper dominates the median, the ink does not).
+        Tint: blue/green and red/green of the median colour (white balance; an exposure change leaves it alone)."""
+        x0, y0, x1, y1 = roi
+        crop = frame[y0:y1, x0:x1]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        half = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        sharp = float(cv2.Laplacian(half, cv2.CV_32F).var()) / max(float(half.mean()), 1.0) ** 2
+        dev = np.abs(gray.astype(np.int16) - cv2.blur(gray, (3, 3)))[::2, ::2]
+        b, g, r = np.median(cv2.resize(crop, (32, 32), interpolation=cv2.INTER_AREA).reshape(-1, 3), axis=0).astype(np.float32)
+        return sharp, 1.4826 * float(np.median(dev)), np.array([b, r], np.float32) / max(float(g), 1.0)
+
+    def _fit(self, frame: np.ndarray) -> bool:
+        """Is the picture of the slip that waits for its lift as good as it was when the slip was read? A blur (autofocus
+        hunting after a hand went by), a burst of noise or a colour cast (exposure, white balance being readjusted) makes the
+        ink of the slip look like another's: no basis to call it a new slip."""
+        sharp, noise, tint = self._quality(frame, self._ref[0])
+        b_sharp, b_noise, b_tint = self._base_q
+        return (sharp >= self.CRISP_KEEP * b_sharp and noise <= 2.0 * b_noise + 3.0
+                and bool(np.all(np.abs(tint / np.maximum(b_tint, 1e-3) - 1.0) <= self.TINT_KEEP)))
+
     def _ms(self, t0: float) -> float:
         return round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -287,6 +320,9 @@ class CaptureEngine:
                 timings["read_ms"] = self._ms(t0)
                 return self._hold(quad, timings)
             timings["read_ms"] = self._ms(t0)
+            if verified:                                     # the slip entered is still there: a look that fails is no news
+                self._poll_at = self.clock() + self._poll_every()
+                return Update(WAIT_REMOVE, self._wait_msg, self._captured_quad, 1.0, timings=timings)
             self._set_reference(frame, quad, fresh)
             self._errored = True
             self._base = None
@@ -310,9 +346,13 @@ class CaptureEngine:
             self._poll_at = self.clock() + self._poll_every()      # the picture changed again meanwhile: not settled yet
             return Update(WAIT_REMOVE, self._wait_msg, self._captured_quad, 1.0, timings=timings)
         self._hand_t0, self._hand_seen, self._holding = None, False, False
+        if verified and sum(v in (sv.MULTIPLE, sv.WEAK, sv.HEAVY, sv.OCCLUDED) for v in reading.verdicts) >= self.BAD_ROWS:
+            self._poll_at = self.clock() + self.POLL_DEFER_S      # a picture gone bad (blur, a colour cast) is no new slip
+            return Update(WAIT_REMOVE, self._wait_msg, self._captured_quad, 1.0, timings=timings)
         self._errored = False
         self._set_reference(frame, quad, fresh)
         self._base = (fp, reading.grid, sv.alignment_template(reading))
+        self._base_q = self._quality(frame, self._ref[0])
         self._cand = None
         self._polls = 0
         self._poll_at = self.clock() + self.POLL_FIRST_S
@@ -395,6 +435,10 @@ class CaptureEngine:
         if self._poll_at is None or now < self._poll_at:
             return None
         base, grid, template = self._base
+        if not self._fit(frame):
+            self._cand = None
+            self._poll_at = now + self.POLL_DEFER_S
+            return None
         if self._cand is not None:                       # the second look
             cand, self._cand = self._cand, None
             quad = sv.find_slip_quad(frame)

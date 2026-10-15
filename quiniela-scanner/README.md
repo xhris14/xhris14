@@ -167,7 +167,7 @@ the slip on the review list. If names regularly queue up
 `name_workers`; a name only waits for a free reader without being failed while other names keep coming back.
 
 **No `ANTHROPIC_API_KEY`** / `read_names_with_claude: false` -> every slip opens the classic card and you type the name.
-**The reader stops working in the middle of a stack** (key rejected, no credit, no internet, rate limit, no answer): after 3 such
+**The reader stops working in the middle of a stack** (key rejected, no credit, no internet, rate limit, no answer, an unexpected error inside the reader): after 3 such
 failures in a row (or 3 requests silent for half a time-out) one red bar says **NAME READING IS NOT WORKING (reason)**, Auto-enter is
 switched off so each slip waits on the card for you to type the name while it is in your hand, and there is no beep per slip. The picks
 of the slips before that went in as usual, their names are `?` (red rows). The first name that is read correctly again clears the bar
@@ -210,7 +210,7 @@ kept. Delete the file to start from the defaults.
 **`scanner.log`** (next to `config.json`) gets one line per entered slip: time, ticket, `read_ms` (reading the picture),
 `excel_ms`, `name_ms`, status (`ok` / `review` / `wrong` / `undone`), the name written, plus how long the window's thread took
 and the gap since the previous slip - and lines for start-up, Excel/camera problems, the breaker, `ALERT`s, `DUPLICATE_SKIPPED`,
-`READER_DOWN` / `READER_OK` and `AUDIT_ERROR`. If the app is slow or misbehaves on your PC, send that file.
+`READER_DOWN` / `READER_OK`, `AUDIT_ERROR` and `CLOSE_DROPPED` (slips that were still on the card or in the queue when you closed the window anyway). If the app is slow or misbehaves on your PC, send that file.
 
 **`scans/log.csv`** (UTF-8 with BOM, so Excel shows accents right) has one row per entered slip next to its picture. If the file cannot be
 written (typically: it is open in Excel) the rows go to `scans/log-<time>.csv` instead, the red bar says so and nothing is lost; the same

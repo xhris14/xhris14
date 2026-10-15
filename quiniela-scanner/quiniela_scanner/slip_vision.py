@@ -25,7 +25,7 @@ BLANK = "blank"          # nothing marked
 MULTIPLE = "multiple"    # two columns marked (correction / double mark)
 WEAK = "weak"            # a mark was found but it is faint or small
 HEAVY = "heavy"          # scribbled over - probably a crossed-out mark
-OCCLUDED = "occluded"    # a hand / finger covers the row's mark cells: nothing can be said about the row
+OCCLUDED = "occluded"    # a hand / finger (or a burnt-out glare) covers the row's mark cells: nothing can be said about the row
 
 
 class SlipNotFound(Exception):
@@ -352,6 +352,9 @@ class Settings:
     hand_guard: bool = True         # look for skin: OCCLUDED rows, and tell the capture engine a hand is on the slip
     skin_slip: float = 0.01         # share of the slip covered by skin that means "a hand is on it"
     skin_row: float = 0.01          # share of a row's mark area (+ half a cell around) under skin: row is OCCLUDED
+    glare_guard: bool = True        # a patch burnt out to white (a lamp's reflection) over a row's cells: row is OCCLUDED too
+    glare_share: float = 0.10       # share of a cell burnt out (every channel >= 250) that hides a mark
+    glare_paper_max: float = 225.0  # ... provided the paper itself is not that bright (else burnt white is just paper)
 
 
 @dataclass
@@ -443,6 +446,19 @@ def _skin_report(skin: np.ndarray, g: Grid, s: Settings) -> tuple[list[bool], bo
     return rows, box.size > 0 and cv2.countNonZero(box) > s.skin_row * box.size
 
 
+def _glare_rows(fin: np.ndarray, g: Grid, s: Settings) -> list[bool]:
+    """Per row: is a patch burnt out to white over one of its cells? A blown-out reflection erases a mark as well as a
+    finger does, and an empty cell reads as 'nothing marked' (F1). Only judged when the paper is clearly darker than
+    the burnt pixels (the real photo's paper: 140-185 at gain 0.7-1.3, no cell above 0.00 burnt; a burnt 50-110 px
+    patch over a mark: 0.2-1.0 of its cell)."""
+    if float(np.median(fin[::4, ::4, 1])) > s.glare_paper_max:
+        return [False] * g.n_rows
+    burnt = (fin.min(axis=2) >= 250).astype(np.uint8) * 255
+    if cv2.countNonZero(burnt) < 200:
+        return [False] * g.n_rows
+    return [any(_cell_ink(burnt, g, r, c)[0] >= s.glare_share for c in range(3)) for r in range(g.n_rows)]
+
+
 def _faint_fractions(fin: np.ndarray, g: Grid) -> np.ndarray:
     """(rows, 3) ink share per cell from a more sensitive pass (blur 5x5, adaptive threshold C=6): only run
     for rows that read BLANK, to tell a dry pen / pencil from an empty box. Measured on the real photo and
@@ -506,6 +522,10 @@ def read_slip(frame: np.ndarray, n_rows: int = 9, settings: Settings | None = No
         if skin_fraction > 0:
             occluded, name_hidden = _skin_report(skin, g, s)
 
+    covered = occluded
+    if s.glare_guard:
+        covered = [a or b for a, b in zip(occluded, _glare_rows(fin, g, s))]
+
     fractions = np.zeros((g.n_rows, 3), np.float32)
     cells: dict = {}
     for r in range(g.n_rows):
@@ -520,7 +540,7 @@ def read_slip(frame: np.ndarray, n_rows: int = 9, settings: Settings | None = No
     picks, verdicts, cands = [], [], []
     for r in range(g.n_rows):
         f = fractions[r]
-        if occluded[r]:                                   # a hand over the cells: the ink there says nothing
+        if covered[r]:                                    # a hand / a glare over the cells: the ink there says nothing
             picks.append("")
             verdicts.append(OCCLUDED)
             cands.append(())
@@ -579,6 +599,9 @@ _FP_MIN_PX = 40                 # fewer ink pixels than this = nothing written t
 MARKS_SAME = 0.90               # min stroke coverage (both ways) for the marks of one slip
 NAME_SAME = 0.80                # ... and for its handwriting
 MARKS_STRONG = 0.95             # marks this alike are one slip whatever the handwriting says (a hand may cover it)
+NAME_STRONG = 0.95              # handwriting this alike is one slip's, never two hands': the marks then only need MARKS_NEAR
+MARKS_NEAR = 0.85               # (one slip photographed again scored 0.877 on the marks at 1280x720; another slip with the same
+                                # picks <= 0.76, and its handwriting <= 0.71)
 _FP_MIN_ROWS = 4                # ... provided at least this many rows carry a mark: one or two X prove little
 
 
@@ -760,6 +783,8 @@ def same_ink(a: Fingerprint, b: Fingerprint, marks_min: float = MARKS_SAME) -> b
     marks, name = slip_similarity(a, b)
     if a.name_hidden or b.name_hidden:
         name = None
+    if name is not None and name >= NAME_STRONG and marks >= min(marks_min, MARKS_NEAR):
+        return True
     return marks >= marks_min and (name is None or name >= NAME_SAME * marks_min / MARKS_SAME)
 
 
@@ -779,6 +804,8 @@ def same_slip(a: Fingerprint, b: Fingerprint) -> bool:
         return True
     if a.name_hidden or b.name_hidden:                  # no handwriting to compare: the marks have to carry it
         return a.marks_px >= _FP_MIN_PX and b.marks_px >= _FP_MIN_PX and marks >= MARKS_SAME
+    if name is not None and name >= NAME_STRONG and marks >= MARKS_NEAR and a.marks_px >= _FP_MIN_PX and b.marks_px >= _FP_MIN_PX:
+        return True                                     # the very same handwriting: a slightly worse look at the marks is the same slip
     if a.name_blank != b.name_blank:                    # someone wrote / nobody wrote a name
         return False
     if a.name_blank and a.marks_px < _FP_MIN_PX and b.marks_px < _FP_MIN_PX:

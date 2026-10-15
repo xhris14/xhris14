@@ -659,3 +659,109 @@ def test_a_single_odd_look_does_not_make_a_new_slip(monkeypatch):
     assert [info["top"] for _, info, _ in reads(ev)] == [A]            # only the first read
     assert len(eng.history) == 1 and not [u for _, _, u in ev if u.error]
     assert eng.state == WAIT_REMOVE
+
+
+# =============================================================================== the re-check must not make a second ticket of a slip whose PICTURE went bad
+# (found while validating SOAK-4: an autofocus that hunts after a hand went by, a burst of sensor noise, a colour cast on the
+# slip that lies there waiting for its lift made its ink look like another slip's: the re-check entered it again)
+class Episode:
+    """A (played by ``play``) is read, lies there while ``fn`` spoils the picture for ``seconds``, is lifted and B is read."""
+
+    def __init__(self, fn, seconds):
+        st = Stage(seed=2)
+        a = st.add(draw_slip_named(PICKS, "CLEMENTE O.", seed=1))
+        b = st.add(draw_slip_named(OTHER, "ANA", seed=5))
+        bank_a = [f for f, _ in st.hold(a, 8, under=b)]
+        bank_b = [f for f, _ in st.hold(b, 8)]
+        n = int(seconds * 30)
+        self.frames = [f for f, _ in st.empty(3, under=b)] + [bank_a[i % 8] for i in range(14)]
+        self.frames += [fn(bank_a[i % 8], np.sin(np.pi * (i + 1) / (n + 1)) ** 0.5) for i in range(n)]
+        self.frames += [bank_a[i % 8] for i in range(20)] + [f for f, _ in st.lift(a, b, 6)] + [bank_b[i % 8] for i in range(16)]
+        self.picks = [tuple(PICKS), tuple(OTHER)]
+
+
+def _blur(sigma):
+    return lambda f, p: cv2.GaussianBlur(f, (0, 0), sigma * p) if sigma * p > 0.2 else f
+
+
+def _noise(sigma):
+    rng = np.random.default_rng(5)
+    return lambda f, p: np.clip(f.astype(np.float32) + rng.normal(0, sigma * p, f.shape), 0, 255).astype(np.uint8)
+
+
+def _cast(s):
+    return lambda f, p: np.clip(f.astype(np.float32) * np.array([1 - 0.35 * s * p, 1.0, 1 + 0.2 * s * p], np.float32), 0, 255).astype(np.uint8)
+
+
+EPISODES = [("autofocus hunting, blur 2 px", _blur(2.0), 1.5, 30), ("autofocus stuck out of focus, blur 3 px", _blur(3.0), 3.0, 30),
+            ("blur 2 px at 15 fps", _blur(2.0), 1.5, 15), ("noise burst, sigma 20", _noise(20), 1.5, 30),
+            ("yellow cast", _cast(1.0), 1.5, 30)]
+
+
+@pytest.mark.parametrize("name,fn,seconds,fps", EPISODES, ids=[e[0] for e in EPISODES])
+def test_a_spoiled_picture_of_the_slip_entered_is_not_a_new_slip(name, fn, seconds, fps):
+    ep = Episode(fn, seconds)
+    readings, dups, errs, checks = play(ep, fps)
+    assert readings == ep.picks and not errs, readings
+
+
+def test_the_picture_check_is_what_keeps_the_re_check_quiet(monkeypatch):
+    """Without it (the re-check judging by the ink alone) the same episodes enter slip A again."""
+    monkeypatch.setattr(CaptureEngine, "_fit", lambda self, frame: True)
+    monkeypatch.setattr(CaptureEngine, "BAD_ROWS", 99)
+    again = []
+    for name, fn, seconds, fps in EPISODES[1:2] + EPISODES[3:]:     # stuck blur, noise burst, colour cast
+        ep = Episode(fn, seconds)
+        if play(ep, fps)[0] != ep.picks:
+            again.append(name)
+    assert len(again) == 3, again
+
+
+def test_a_good_picture_is_fit_and_a_blurred_or_noisy_one_is_not():
+    st = Stage(seed=2)
+    a = st.add(draw_slip_named(PICKS, "CLEMENTE O.", seed=1))
+    eng = CaptureEngine(9)
+    frames = [f for f, _ in st.hold(a, 8)]
+    for f in frames[:7]:
+        eng.feed(f)
+    assert eng.state == WAIT_REMOVE and eng._fit(frames[7]) and eng._fit(_blur(0.7)(frames[7], 1.0))
+    assert not eng._fit(_blur(1.5)(frames[7], 1.0)) and not eng._fit(_noise(20)(frames[7], 1.0)) and not eng._fit(_cast(1.0)(frames[7], 1.0))
+
+
+# =============================================================================== one slip photographed again, marks a little worse
+@pytest.mark.parametrize("marks,name,same", [(0.87, 0.99, True), (0.85, 0.96, True), (0.84, 0.99, False), (0.87, 0.90, False),
+                                              (0.80, 1.00, False), (0.93, 0.50, False)])
+def test_marks_a_little_worse_than_usual_are_one_slip_when_the_handwriting_is_the_same(ref, monkeypatch, marks, name, same):
+    """Measured: one slip of the soak library, 8 photos at 1280x720, scored 0.877 on the marks (0.998 on the handwriting)
+    between two of them - below MARKS_SAME, so a re-read after a hand went by was entered a second time. The very same
+    handwriting (both ways >= NAME_STRONG) cannot be two hands': the marks then only need MARKS_NEAR."""
+    other = _fp(draw_slip_named(PICKS, "CLEMENTE O.", seed=7), angle=-3, seed=2)
+    monkeypatch.setattr(sv, "slip_similarity", lambda a, b: (marks, name))
+    assert sv.same_slip(ref, other) is same
+    assert sv.same_ink(ref, other) is (same or (marks >= sv.MARKS_SAME and name >= sv.NAME_SAME))
+
+
+def test_a_re_check_that_cannot_find_the_slip_is_no_error(monkeypatch):
+    """The slip entered still lies there; the re-check's full read happens to fail (a pen across the rules...): no error, no
+    beep, nothing entered - the engine just looks again later (it used to report 'Slip seen but not recognised' and stop checking)."""
+    st, ids = make_stage()
+    A, B = ids[:2]
+    other = sv.fingerprint(sv.read_slip(next(st.hold(B, 1))[0]))
+    clock = VClock()
+    eng = CaptureEngine(9, clock=clock)
+    real_read, calls = sv.read_slip, []
+
+    def read(frame, *a, **k):
+        calls.append(1)
+        if len(calls) > 1:
+            raise sv.SlipNotFound("a pen across the rules")
+        return real_read(frame, *a, **k)
+    monkeypatch.setattr(sv, "read_slip", read)
+    monkeypatch.setattr(sv, "quick_fingerprint", lambda frame, grid, settings=None, template=None: (other, 0.0))
+    ev = []
+    for k, (frame, info) in enumerate(list(st.empty(3)) + list(st.hold(A, 90))):
+        clock.t = k / 30.0
+        ev.append((k, info, eng.feed(frame)))
+    assert len(calls) >= 2                                          # the re-check did try
+    assert [info["top"] for _, info, _ in reads(ev)] == [A]
+    assert not [u for _, _, u in ev if u.error] and eng.state == WAIT_REMOVE

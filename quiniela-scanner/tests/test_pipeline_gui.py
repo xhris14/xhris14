@@ -1297,6 +1297,20 @@ def test_closing_with_a_card_or_waiting_slips_asks_first(env, mk, readings, flag
     assert "CLOSE_DROPPED  card=1 backlog=1" in (tmp / "scanner.log").read_text()
 
 
+def test_a_slip_that_needs_a_card_while_the_window_is_closing_is_logged_as_dropped(env, mk, readings, flagged):
+    """G02: the question is asked before the names are collected; a slip the camera had already handed over can open a
+    card meanwhile and would vanish without a trace when the window goes."""
+    tmp, _ = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, readings[0], good("ANA"), delay=0.4)
+    assert entered(app, 1)
+    inject(app, reader, flagged, good("BETO"))                        # on its way when the operator clicks X
+    app.on_close()
+    assert row_of(backend, 0)[0] == "ANA"
+    assert (tmp / "scanner.log").read_text().count("CLOSE_DROPPED  card=1 backlog=0 late=1") == 1
+
+
 # ======================================================================================= review round 2: the tick and the ghost row
 def test_a_failing_preview_does_not_starve_the_name_timeouts_or_eat_the_memory(env, mk, readings):
     """G06: render_preview raising on every tick used to stop check_jobs, and every exception kept its traceback (and
@@ -1316,6 +1330,24 @@ def test_a_failing_preview_does_not_starve_the_name_timeouts_or_eat_the_memory(e
     assert all(isinstance(e, str) and len(e) <= 200 for e in app.callback_errors)
     assert "INTERNAL ERROR - ValueError" in app.alert_var.get()       # the first occurrence is visible
     gate.set()
+    app.callback_errors.clear()
+
+
+def test_a_stage_of_the_tick_that_keeps_failing_does_not_stop_the_stages_after_it(env, mk, flagged):
+    """G06: every stage of the tick has its own try/except - a bug in the preview must not stop the card countdown
+    that comes after it (and one in the name time-outs must not stop the stages behind that)."""
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    inject(app, reader, flagged, good("ANA"))
+    assert pump(app, lambda: app.pending is not None)
+    ran = []
+
+    def broken(*a):
+        raise ValueError("stage bug")
+    app.render_preview = broken
+    app.maybe_auto = lambda: ran.append("auto")
+    assert pump(app, lambda: len(ran) >= 3, 5)                        # still runs on every tick, behind the failing preview
+    assert app.callback_error_count > 0 and "INTERNAL ERROR - ValueError: stage bug" in app.alert_var.get()
     app.callback_errors.clear()
 
 
@@ -1414,6 +1446,20 @@ def test_a_failure_about_one_slip_is_not_a_reader_outage(env, mk, readings):
     assert not app._rd_down and app.auto_var.get() is True and "NOT WORKING" not in app.alert_var.get()
 
 
+def test_a_reader_that_keeps_raising_is_an_outage_too(env, mk, readings):
+    """SOAK-3 (the soak harness's 'reader raises' run): read() is not supposed to raise; a reader that does, slip after
+    slip, used to give 60 '?' rows and 60 beeps without a word about it."""
+    tmp, beeps = env
+    reader = ScriptedReader()
+    app, backend = mk(reader=reader)
+    for k in range(3):
+        inject(app, reader, readings[k], RuntimeError("API key revoked"), delay=0.02)
+        assert entered(app, k + 1) and named(app, app.entries[k])
+    assert app._rd_down and app.auto_var.get() is False
+    assert "NAME READING IS NOT WORKING (name reading failed (RuntimeError))" in app.alert_var.get()
+    assert [row_of(backend, k)[0] for k in range(3)] == ["?"] * 3
+
+
 def test_requests_that_stay_silent_raise_the_alert_before_their_timeouts(env, mk, readings, monkeypatch):
     """SOAK-3 (black-holed API): three requests silent for a while and nothing answered = the reader is down."""
     monkeypatch.setattr(gui, "READER_HANG_S", 0.2)
@@ -1432,7 +1478,8 @@ def test_requests_that_stay_silent_raise_the_alert_before_their_timeouts(env, mk
     (FakeAnthropic.APITimeoutError("t"), True), (FakeAnthropic.APIConnectionError("c"), True),
     (FakeAnthropic.AuthenticationError("a"), True), (FakeAnthropic.RateLimitError("r"), True),
     (FakeAnthropic.APIStatusError("s"), True), (FakeAnthropic.APIError("e"), True),
-    (RuntimeError("anything else"), False)])
+    (RuntimeError("anything else"), True),                            # the reader machinery itself failing: not about the slip
+    (ValueError("a picture that cannot be encoded"), False)])
 def test_name_reader_marks_service_failures_as_systemic(exc, systemic_flag):
     def create(**kw):
         raise exc
@@ -1511,6 +1558,14 @@ def test_a_roomy_screen_keeps_the_normal_layout(env, mk, monkeypatch):
     app, backend = mk()
     settle(app, 0.2)
     assert not app.compact and app.preview_w == gui.PREVIEW_W and not app._mid_sb.winfo_ismapped()
+
+
+def test_history_rows_are_as_tall_as_the_font(env, mk):
+    """G11 (150 % DPI): ttk's default 20 px row clipped the text of the list (the rows overlapped in the screenshots)."""
+    from tkinter import font as tkfont, ttk
+    app, backend = mk()
+    rowheight = int(ttk.Style(app).lookup("Treeview", "rowheight"))
+    assert rowheight >= 20 and rowheight >= tkfont.nametofont("TkDefaultFont").metrics("linespace") + 4
 
 
 def key_to(app, widget, key):

@@ -296,6 +296,7 @@ def test_a_hand_resting_for_ever_on_an_entered_slip_never_makes_a_second_ticket(
                    [f for f, _ in st.lift(A, B, 8)], [f for f, _ in st.hold(B, 14)])
     assert [u.reading.picks for _, u in emitted(ev)] == [PICKS, OTHER]
     assert any(u.duplicate for _, u in ev)                                    # the occluded read matched A and was dropped
+    assert [h.occluded for h in eng.history] == [(), ()]                      # ... and never replaced A's clean fingerprint
 
 
 def test_a_cheap_look_that_cries_hand_for_ever_is_checked_by_a_real_read(monkeypatch):

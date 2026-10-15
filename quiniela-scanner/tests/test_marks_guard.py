@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from quiniela_scanner import slip_vision as sv
-from helpers import draw_cross, draw_scribble, draw_slip, draw_staple, on_webcam_canvas
+from helpers import cell_centre, draw_cross, draw_scribble, draw_slip, draw_staple, on_webcam_canvas
 
 REAL_SLIP = os.environ.get("QUINIELA_REAL_SLIP", "")        # a real slip photo, kept out of the repo
 
@@ -118,6 +118,51 @@ def test_an_x_a_bit_off_centre_in_its_row_is_still_clean(dy):
     assert rd.verdicts[3] == sv.OK and rd.picks[3] == "L"
 
 
+# ===================================================================== E2, glare: a burnt-out patch over a mark
+def dimmer(img, gain=0.8):
+    return np.clip(img.astype(np.float32) * gain, 0, 255).astype(np.uint8)       # paper ~190: burnt white stands out from it
+
+
+def glare_over(img, r, c, size=70, hard=True):
+    cx, cy = cell_centre(r, c)
+    m = np.zeros(img.shape[:2], np.float32)
+    cv2.circle(m, (cx, cy), size // 2, 1.0, -1)
+    m = cv2.GaussianBlur(m, (0, 0), 3 if hard else size / 6)
+    return np.clip(img.astype(np.float32) * (1 - m[..., None]) + 300 * m[..., None], 0, 255).astype(np.uint8)
+
+
+PICKS = list("LVLLELLVE")
+
+
+@pytest.mark.parametrize("size", [70, 110])
+def test_a_blown_out_patch_over_a_mark_is_occluded_not_an_empty_box(size):
+    """The mark is wiped out by a reflection: the cell reads empty, which used to be entered as F1."""
+    clean = draw_slip(PICKS, rng=np.random.default_rng(1))
+    assert read(dimmer(clean)).verdicts == [sv.OK] * 9                          # no glare, no flag
+    reach = 1 if size < 100 else 2                                               # rows the patch touches besides its own
+    for r in (0, 4):
+        rd = read(glare_over(dimmer(clean), r, "LEV".index(PICKS[r]), size))
+        assert rd.verdicts[r] == sv.OCCLUDED and rd.picks[r] == "" and not rd.clean, (r, rd.verdicts[r])
+        assert not rd.hand                                                       # a glare is not a hand: the engine does not wait for it
+        assert all(rd.verdicts[i] == sv.OK for i in range(9) if abs(i - r) > reach), rd.verdicts
+    # (a hard patch over the last row also bites into the rules that locate the rows: that slip is flagged, never clean)
+    assert not read(glare_over(dimmer(clean), 8, "LEV".index(PICKS[8]), size)).clean
+
+
+def test_a_soft_reflection_over_a_mark_never_reads_as_empty():
+    clean = draw_slip(PICKS, rng=np.random.default_rng(1))
+    for r in (0, 4, 8):
+        rd = read(glare_over(dimmer(clean), r, "LEV".index(PICKS[r]), 90, hard=False))
+        assert rd.verdicts[r] == sv.OCCLUDED or (rd.verdicts[r] == sv.OK and rd.picks[r] == PICKS[r]), (r, rd.verdicts[r], rd.picks[r])
+
+
+def test_the_glare_guard_can_be_switched_off():
+    clean = draw_slip(PICKS, rng=np.random.default_rng(1))
+    img = on_webcam_canvas(glare_over(dimmer(clean), 4, 1), scale=0.5, angle=4, noise=3)
+    assert sv.read_slip(img).verdicts[4] == sv.OCCLUDED
+    assert sv.read_slip(img, 9, sv.Settings(glare_guard=False)).verdicts[4] == sv.BLANK        # what it used to do
+
+
 # ===================================================================== the real photo must not notice any of it
 @pytest.fixture(scope="module")
 def real():
@@ -152,3 +197,20 @@ def test_the_real_photos_nine_x_marks_still_read_clean(real, kw):
     rd = sv.read_slip(_canvas(real, **kw))
     assert rd.picks == list("LVLLLLLLE") and rd.clean, (rd.verdicts, rd.ink.max(axis=1))
     assert 0.10 < rd.ink.max(axis=1).min() and rd.ink.max(axis=1).max() < 0.30      # real X marks: 0.12-0.2 of a cell
+
+
+def test_a_blown_out_patch_over_a_mark_of_the_real_photo_is_occluded(real):
+    frame = _canvas(real)
+    rd = sv.read_slip(frame)
+    assert rd.clean and rd.picks == list("LVLLLLLLE")
+    inv = np.linalg.inv(rd.grid.matrix)
+    for r in (1, 5, 8):
+        c = "LEV".index(rd.picks[r])
+        ctr = rd.grid.corners[r:r + 2, c:c + 2].reshape(-1, 2).mean(axis=0)
+        x, y = cv2.perspectiveTransform(ctr.reshape(1, 1, 2).astype(np.float32), inv)[0, 0]
+        hit = frame.copy()
+        cv2.circle(hit, (int(x), int(y)), 18, (255, 255, 255), -1)
+        got = sv.read_slip(hit)
+        assert got.verdicts[r] == sv.OCCLUDED and got.picks[r] == "" and not got.hand, (r, got.verdicts[r])
+        assert [got.picks[i] for i in range(9) if abs(i - r) > 1] == [rd.picks[i] for i in range(9) if abs(i - r) > 1]
+        assert got.verdicts[r - 1] == sv.OK and got.verdicts[min(r + 1, 8)] in (sv.OK, sv.OCCLUDED)

@@ -698,3 +698,69 @@ def test_formula_tickets_survive_our_own_saves_in_the_file_backend(tmp_path):
 def test_macro_and_legacy_workbooks_are_refused_as_files(tmp_path, name):
     with pytest.raises(ExcelError, match="only plain .xlsx"):
         OpenpyxlBackend(str(tmp_path / name))
+
+
+# ------------------------------------------------------------------ hardening found while re-checking the fixes
+def test_a_block_that_starts_right_underneath_is_not_reported_as_cut_short(tmp_path):
+    sink, be, app, ws = fresh(tmp_path, filled=(52, 0, 0))
+    for c, v in zip(range(TICKET_COL, TICKET_COL + 11), ["#", "NOMBRE"] + list(range(1, 10))):
+        ws.cells[(57, c)] = v                                 # the next block's header, directly under block 1
+    for i in range(5):
+        ws.cells[(58 + i, TICKET_COL)] = 9000 + i
+    sink.refresh()
+    first, second = sorted((b for b in sink.blocks if b.name_col == NAME_COL), key=lambda b: b.header_row)
+    assert first.rows[-1] == 56 and second.rows[0] == 58
+    assert sink.layout_warnings == []                         # its tickets are not "cut off" ones of block 1
+    with pytest.raises(BlockFull) as ei:
+        sink.write_row_fast(first, picks_of(0), name="X")
+    assert str(ei.value).endswith("every row already has data")
+    assert sink.write_row_fast(second, picks_of(0), name="X").ticket == 9000
+
+
+def test_resolve_block_accepts_a_block_info_like_write_row_fast_does(tmp_path):
+    sink, be, app, ws = fresh(tmp_path)
+    info = sink.block_infos()[1]
+    ws.user_insert_row(2)
+    sink.refresh()
+    assert sink.resolve_block(info) is sink.resolve_block(info.block) and sink.resolve_block(info).key == "ENTRY PG1!Z5"
+
+
+@pytest.mark.parametrize("make", [
+    lambda: FakeComError(-2147417848, "the object invoked has disconnected from its clients"),
+    lambda: PyWinComError(-2147417851, hresult=-2147352567),                             # server fault inside Excel
+], ids=["hresult", "excepinfo"])
+def test_excel_gone_is_explained_and_not_taken_for_busy(tmp_path, no_sleep, make):
+    sink, be, app, ws = fresh(tmp_path)
+    ws.check_busy = (boom := raiser(make))
+    with pytest.raises(ExcelError, match="closed or restarted") as ei:
+        sink.write_row_fast(None, picks_of(0), name="X")
+    assert not isinstance(ei.value, ExcelBusy) and no_sleep == [] and len(boom.calls) == 2
+    assert (15, NAME_COL) not in ws.cells
+
+
+def test_a_save_that_cannot_even_create_its_temp_file_is_an_excel_error(tmp_path, monkeypatch):
+    path = make_pool_workbook(tmp_path / "JORNADA 10 PC.xlsx")
+    sink = ExcelSink(OpenpyxlBackend(str(path)))
+    before = path.read_bytes()
+
+    def no_temp(**kw):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(xs.tempfile, "mkstemp", no_temp)
+    with pytest.raises(ExcelError, match="could not save"):
+        sink.write_row_fast(None, picks_of(0), name="X")
+    assert path.read_bytes() == before
+
+
+def test_a_block_held_full_by_formulas_says_so_instead_of_claiming_data(tmp_path):
+    sink, be, app, ws = fresh(tmp_path, filled=(0, 0, 0))
+    for r in range(5, 57):                                    # =IF(A5="","",A5) in every NOMBRE cell of block 1
+        ws.cells[(r, NAME_COL)] = ""
+        ws.formulas.add((r, NAME_COL))
+    sink.refresh()
+    block = sink.block_infos()[0].block
+    assert sink.block_infos()[0].free == 0 and any("52 name/pick cell(s) hold formulas" in w for w in sink.layout_warnings)
+    with pytest.raises(BlockFull, match=r"every row already has data or a formula that shows nothing \(52 row\(s\), "
+                                        r"first row 5; formulas are never overwritten\)"):
+        sink.write_row_fast(block, picks_of(0), name="X")
+    assert len(ws.formulas & {(r, NAME_COL) for r in range(5, 57)}) == 52
+    assert sink.write_row_fast(sink.block_infos()[1].block, picks_of(0), name="X").ticket == 481    # other blocks work

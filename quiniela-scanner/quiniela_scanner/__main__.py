@@ -69,13 +69,15 @@ def cmd_excel(args, cfg: Config) -> int:
     try:
         be = open_backend(args.backend or cfg.backend, cfg.workbook, args.path or cfg.workbook_path)
         sink = ExcelSink(be, cfg.sheets, cfg.name_header)
-    except ExcelError as e:
-        print("Excel problem:", e)
+    except Exception as e:                                # (not only ExcelError: this is the first check of a new setup)
+        print("Excel problem:", e if isinstance(e, ExcelError) else f"{e.__class__.__name__}: {e}")
         return 1
     print("workbook:", be.label)
     for info in sink.block_infos():
         nxt = info.first_free.describe() if info.first_free else "FULL"
         print(" -", info.label, "\n     next free:", nxt)
+    for w in sink.layout_warnings:                        # the same lines the window shows in its amber bar
+        print("WARNING:", w)
     return 0
 
 

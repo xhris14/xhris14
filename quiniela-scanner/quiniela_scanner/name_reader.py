@@ -99,7 +99,9 @@ class ClaudeNameReader:
         try:
             return self._read(name_crop, title_crop)
         except Exception as e:                       # a pool worker must never die with an exception
-            return NameResult(error=f"name reading failed ({e.__class__.__name__})")
+            # (a picture that cannot be encoded is about this slip; any other surprise is the reader itself failing)
+            return NameResult(error=f"name reading failed ({e.__class__.__name__})",
+                              systemic=not isinstance(e, (ValueError, cv2.error)))
 
     def _read(self, name_crop: np.ndarray, title_crop: np.ndarray | None) -> NameResult:
         a = self._anthropic

@@ -437,9 +437,10 @@ class OpenpyxlBackend:
 
     def _save_file(self):
         """Write next to the workbook, then swap it in: a crash or a full disk mid-save leaves the old file."""
-        fd, tmp = tempfile.mkstemp(prefix="~quiniela-", suffix=".tmp", dir=str(Path(self.path).resolve().parent))
-        os.close(fd)
+        tmp = ""
         try:
+            fd, tmp = tempfile.mkstemp(prefix="~quiniela-", suffix=".tmp", dir=str(Path(self.path).resolve().parent))
+            os.close(fd)
             self._wb.save(tmp)
             try:
                 shutil.copymode(self.path, tmp)
@@ -449,10 +450,11 @@ class OpenpyxlBackend:
         except OSError as e:
             raise ExcelError(f"could not save {self.workbook_name} (is it open in Excel?): {e}") from e
         finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     def save(self):
         self.calls["save"] += 1
@@ -518,16 +520,20 @@ class ComBackend:
             ws = self._sheets[sheet] = self.wb.Worksheets(sheet)
         return ws
 
-    @classmethod
-    def _is_busy(cls, e) -> bool:
-        """Excel (not us) refused for now. An error raised INSIDE Excel arrives as DISP_E_EXCEPTION
-        (-2147352567) with the callee's own code in excepinfo[5] - that is where 0x800AC472 lives."""
-        hr = getattr(e, "hresult", None)
-        codes = {hr}
+    @staticmethod
+    def _codes(e) -> set:
+        """Every code a com_error carries. An error raised INSIDE Excel arrives as DISP_E_EXCEPTION (-2147352567)
+        with the callee's own code in excepinfo[5] - that is where 0x800AC472 (cell in edit mode) lives."""
+        codes = {getattr(e, "hresult", None)}
         ei = getattr(e, "excepinfo", None)
         if isinstance(ei, (tuple, list)) and len(ei) >= 6:
             codes.add(ei[5])
-        return bool(codes & cls.BUSY) or (hr is None and "busy" in str(e).lower())
+        return codes
+
+    @classmethod
+    def _is_busy(cls, e) -> bool:
+        """Excel (not us) refused for now."""
+        return bool(cls._codes(e) & cls.BUSY) or (getattr(e, "hresult", None) is None and "busy" in str(e).lower())
 
     def _retry(self, fn):
         if self._screen_stuck:
@@ -548,7 +554,7 @@ class ComBackend:
                     self._sheets.clear()
                     dropped = True
                     continue
-                gone = getattr(e, "hresult", None) in self.GONE
+                gone = bool(self._codes(e) & self.GONE)
                 raise ExcelError(f"Excel error: {e}" + (" - Excel was closed or restarted? Press Connect / "
                                                         "reconnect Excel" if gone else "")) from e
         raise ExcelBusy("Excel is busy (is a cell being edited?). Press Esc in Excel and retry.") from last
@@ -749,14 +755,17 @@ MAX_PROBES = 25                    # free-looking slots tried (one small read ea
 STOP_SCAN = 12                     # rows under a block looked at for ticket-like cells the block stopped before
 
 
-def _block_stop(snap: Snapshot, b: Block):
+def _block_stop(snap: Snapshot, b: Block, blocks=()):
     """None if the block simply ends. Else (row, value, k): its ticket column stops at `row` on a cell that is not
     a ticket number (text '260 ', 260.5, #REF!, a blank spacer) although k ticket-like cells follow within a
-    few rows - the tickets below are NOT part of the block."""
+    few rows - the tickets below are NOT part of the block. The look-ahead ends at the header of a block that
+    starts right underneath (its own tickets are not "cut off" ones)."""
     if b.ticket_col is None or not b.rows:
         return None
     stop = b.rows[-1] + 1
-    cells = [snap.get(stop + i, b.ticket_col) for i in range(STOP_SCAN)]
+    end = min([x.header_row for x in blocks if x is not b and x.sheet == b.sheet and x.ticket_col == b.ticket_col
+               and stop <= x.header_row < stop + STOP_SCAN] + [stop + STOP_SCAN])
+    cells = [snap.get(r, b.ticket_col) for r in range(stop, end)]
     k = sum(1 for v in cells if _ticket_like(v))
     return (stop, cells[0], k) if k else None
 
@@ -767,19 +776,26 @@ def _stop_text(b: Block, stop: tuple) -> str:
             f"(row {row}: {_show(v)}); {k} ticket-like cell(s) below it are NOT used")
 
 
+def _formula_cells(snap: Snapshot, b: Block) -> list:
+    """(row, col) of the name / pick cells of block b that hold a formula showing nothing (never overwritten)."""
+    if not snap.formula_cells or not b.rows:
+        return []
+    return [(r, c) for (r, c) in snap.formula_cells
+            if b.rows[0] <= r <= b.rows[-1] and b.name_col <= c <= b.name_col + N_PICKS]
+
+
 def _survey(snaps: dict, blocks: list, skipped: list) -> tuple:
     """-> (warnings, duplicate tickets as {(sheet, ticket)}): what is wrong with the layout, in words."""
     out = [n for s in snaps.values() for n in s.notes] + list(skipped)
     seen: dict = {}
     for b in blocks:
         snap = snaps[b.sheet]
-        stop = _block_stop(snap, b)
+        stop = _block_stop(snap, b, blocks)
         if stop:
             out.append(f"{b.sheet} column {col_letter(b.name_col)}: {_stop_text(b, stop)}")
         for r in b.rows if b.ticket_col is not None else ():
             seen.setdefault((b.sheet, snap.get(r, b.ticket_col)), []).append(r)
-        held = [(r, c) for (r, c) in snap.formula_cells
-                if b.rows[0] <= r <= b.rows[-1] and b.name_col <= c <= b.name_col + N_PICKS] if snap.formula_cells else []
+        held = _formula_cells(snap, b)
         if held:
             out.append(f"{b.sheet} column {col_letter(b.name_col)}: {len(held)} name/pick cell(s) hold formulas that "
                        f"show nothing (first: row {min(r for r, _ in held)}) - those rows count as taken")
@@ -891,12 +907,13 @@ class ExcelSink:
         the operator selected). refresh() rebuilds the Blocks and rows inserted above a header change its key; the
         block is followed by sheet + column + first ticket, then by the nearest header. None for `old` = the default
         block; None is returned when `old` no longer exists (say so - do not fall back to another block)."""
+        old = getattr(old, "block", old)                   # a BlockInfo works too
         if old is None:
             ordered = sorted(self.blocks, key=lambda b: (b.ticket_col is None,
                                                          self._ticket(b, b.rows[0]) or 0, b.name_col))
             return next((b for b in ordered if self._first_free_row(b) is not None),
                         ordered[0] if ordered else None)
-        same = [b for b in self.blocks if b.sheet == old.sheet and b.name_col == old.name_col]
+        same =[b for b in self.blocks if b.sheet == old.sheet and b.name_col == old.name_col]
         if old.first_ticket is not None:
             same = [b for b in same if b.first_ticket == old.first_ticket] or same
         return next((b for b in same if b.key == old.key),
@@ -1035,8 +1052,13 @@ class ExcelSink:
         first, last = b.rows[0], b.rows[-1]
         t = [self._ticket(b, first), self._ticket(b, last)]
         span = f"tickets {t[0]}-{t[1]}" if None not in t else f"rows {first}-{last}"
-        stop = _block_stop(self.snaps[b.sheet], b)
-        why = f"every row already has data; {_stop_text(b, stop)}" if stop else "every row already has data"
+        snap = self.snaps[b.sheet]
+        stop = _block_stop(snap, b, self.blocks)
+        held = sorted({r for r, _ in _formula_cells(snap, b)})
+        why = "every row already has data" + (f" or a formula that shows nothing ({len(held)} row(s), first row "
+                                              f"{held[0]}; formulas are never overwritten)" if held else "")
+        if stop:
+            why += f"; {_stop_text(b, stop)}"
         raise BlockFull(f"no free ticket in block {b.sheet} column {col_letter(b.name_col)} ({span}): {why}", b)
 
     def _write_ticket(self, block, ticket, values, small, allow_overwrite) -> Receipt:
