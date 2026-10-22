@@ -35,7 +35,8 @@ from .audit import AuditLog, ScanLog
 from .camera import CameraError, FrameGrabber, WebcamSource
 from .capture import HAND_MESSAGE, WAIT_REMOVE, CaptureEngine, Update
 from .config import Config, app_dir
-from .excel_sink import BlockFull, ExcelBusy, ExcelError, ExcelSink, Receipt, SlotTaken, format_name, open_backend
+from .excel_sink import (BlockFull, ExcelBusy, ExcelError, ExcelSink, Receipt, SlotTaken, col_letter, format_name,
+                         open_backend)
 from .name_reader import NameResult, make_reader
 
 FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
@@ -235,7 +236,8 @@ class App(tk.Tk):
         self.infos: list = []
         self.sel_block = None             # the Block the operator selected (followed through sink.resolve_block)
         self.sel_key: str | None = None
-        self.ticket_custom = False        # operator typed a ticket number
+        self.ticket_custom = False        # the Ticket box holds the operator's choice (typed, or the cell clicked in Excel)
+        self.ticket_follow = False        # ... and it is a place to continue from: taken -> the next free ticket after it
         self._ticket_prog = False         # ticket_var is being set by the program, not typed
         self.breaker = ""                 # message while auto-enter is switched off by the circuit breaker
         self._alerts: dict = {}           # kind -> message of every alert that is up (insertion ordered)
@@ -290,6 +292,7 @@ class App(tk.Tk):
         self.bind_all("<Return>", self._on_return)
         self.bind_all("<Escape>", self._on_escape)
         self.bind_all("<F2>", lambda e: self.tag_on.set(not self.tag_on.get()))
+        self.bind_all("<F3>", lambda e: self.start_at_cell())
         self.bind("<Configure>", self._on_resize)
         self.bind_all("<MouseWheel>", self._on_wheel)
         self.bind_all("<Button-4>", self._on_wheel)
@@ -395,6 +398,14 @@ class App(tk.Tk):
         self.auto_var = tk.BooleanVar(value=self.cfg.auto_enter)
         ttk.Checkbutton(tgt, text="Auto-enter clean scans", variable=self.auto_var).grid(row=0, column=4, padx=14)
         self.auto_var.trace_add("write", lambda *a: self.on_auto_change())
+
+        # where the next slip goes: the cell clicked in Excel (or a ticket number typed above); the stack continues from there
+        ttk.Label(tgt, text="Start here:").grid(row=2, column=0, **pad)
+        startrow = ttk.Frame(tgt)
+        startrow.grid(row=2, column=1, columnspan=4, sticky="w", **pad)
+        ttk.Button(startrow, text="Start at the cell I clicked in Excel  (F3)", command=self.start_at_cell).pack(side="left")
+        ttk.Label(startrow, text="  or type a ticket number above - the slips that follow continue from it.",
+                  font=(FONT, 10)).pack(side="left")
 
         # group tag: letters like "RRR" or "E" added before/after every name, switched on/off as you go
         ttk.Label(tgt, text="Group tag:").grid(row=1, column=0, **pad)
@@ -817,6 +828,7 @@ class App(tk.Tk):
         """Only a real edit of the Ticket box (typing, paste, cut) makes the ticket the operator's own choice."""
         if not self._ticket_prog:
             self.ticket_custom = True
+            self.ticket_follow = False                    # a typed ticket is exact: a used one is refused, not skipped
 
     def set_ticket_text(self, text: str):
         self._ticket_prog = True
@@ -835,9 +847,75 @@ class App(tk.Tk):
             self.set_ticket_text(str(slot.ticket) if slot and slot.ticket is not None else "")
         self.check_stock(info, announce)
 
-    def ticket_done(self):
-        """A write (or an undo) used up the ticket box: it goes back to the suggestion for the next slip."""
-        self.ticket_custom = False
+    def ticket_done(self, receipt: Receipt | None = None, freed: int | None = None):
+        """A write (or an undo) used up the ticket box. Normally it goes back to the suggestion for the next slip. A place
+        the operator chose (a typed ticket, the cell clicked in Excel) is where the stack CONTINUES: the box moves on to
+        the next free ticket of that block after a write, and back to the freed ticket after an undo."""
+        chosen = self.ticket_custom and self.sink is not None
+        self.ticket_custom = self.ticket_follow = False
+        self.clear_notice("startcell")
+        if not chosen:
+            return
+        if freed is not None:
+            self.continue_at(freed)
+        elif receipt is not None:
+            blk = receipt.slot.block
+            nxt = self.sink.next_free_after(blk, receipt.row)
+            if self.sink.resolve_block(self.sel_block) is not self.sink.resolve_block(blk):    # (typed a ticket of another block)
+                self.infos = self.sink.block_infos()
+                info = next((i for i in self.infos if i.block.key == blk.key), None)
+                if info is not None:
+                    self.select_info(info)
+            if nxt is not None and nxt.ticket is not None:
+                self.continue_at(nxt.ticket)
+            else:
+                self.notice("You reached the end of the block you started in. The next slip goes to the first free ticket of "
+                            "this block - or click another row in Excel and press F3.", "startcell")
+
+    def continue_at(self, ticket: int):
+        self.set_ticket_text(str(ticket))
+        self.ticket_custom = self.ticket_follow = True
+
+    def start_at_cell(self):
+        """Button / F3: the cell selected in Excel is where the next slip goes, and the slips after it follow."""
+        if self.sink is None:
+            self.alert("Excel is not connected. Open the workbook, then press 'Connect / reconnect Excel'.")
+            return
+        try:
+            self.sink.refresh()                           # (the sheet may have changed since it was last read)
+            cell = self.sink.active_cell()
+        except ExcelError as e:
+            self.alert(f"Could not read the cell selected in Excel: {e}", "startcell")
+            return
+        self.clear_alert("startcell")
+        self.refresh_blocks()
+        if cell is None:
+            self.notice("No selected cell to start from: in the workbook connected here, click a ticket or name cell of the "
+                        "row you want to start at, then press F3 again.", "startcell")
+            return
+        sheet, row, col = cell
+        where = f"{sheet} {col_letter(col)}{row}"
+        slot = self.sink.slot_at(sheet, row, col)
+        info = next((i for i in self.infos if slot is not None and i.block is slot.block), None)
+        if slot is None or info is None:
+            self.notice(f"The selected cell ({where}) is not inside a block. Click a ticket or name cell of the row you "
+                        "want to start at, then press F3.", "startcell")
+            return
+        target = slot if self.sink.is_free(slot) else self.sink.next_free_after(slot.block, slot.row)
+        if target is None:
+            self.notice(f"{where}: this row and every row below it in the block already have data. Click a row that is "
+                        "still empty, then press F3.", "startcell")
+            return
+        self._block_confirm = ""                          # the operator chose: nothing is left to confirm
+        self.clear_alert("fullblock")
+        self.select_info(info)
+        if target.ticket is None:
+            self.notice("This block has no ticket numbers in the sheet, so it is filled from its first free row.", "startcell")
+            return
+        self.continue_at(target.ticket)
+        self.notice(f"Starting at ticket {target.ticket}" +
+                    (f" (ticket {slot.ticket} already has data)" if target is not slot else "") +
+                    " - the next slips continue from there.", "startcell")
 
     def check_stock(self, info, announce: bool = False):
         """Few tickets left in the block (<= LOW_TICKETS): amber 'Block:' label and a line in the strip, and when
@@ -860,7 +938,7 @@ class App(tk.Tk):
 
     def select_info(self, info):
         """The operator (or the program, after a full block) picks a block: its suggestion starts from scratch."""
-        self.ticket_custom = False
+        self.ticket_custom = self.ticket_follow = False
         self._block_gone = False
         self.clear_alert("block")
         self.sel_block, self.sel_key = info.block, info.block.key
@@ -879,6 +957,7 @@ class App(tk.Tk):
         if info:
             self._block_confirm = ""                  # the operator chose: nothing is left to confirm
             self.clear_alert("fullblock")
+            self.clear_notice("startcell")
             self.select_info(info)
 
     def expected_jornada(self) -> str:
@@ -1201,7 +1280,7 @@ class App(tk.Tk):
             return False
         t1 = time.perf_counter()
         try:
-            receipt = self.sink.write_row_fast(block, rd.picks, name="", ticket=ticket)
+            receipt = self.sink.write_row_fast(block, rd.picks, name="", ticket=ticket, or_next=self.ticket_follow)
         except BlockFull as e:                                         # not Excel's fault: the block is used up
             self.block_full(e)
             return False
@@ -1228,7 +1307,7 @@ class App(tk.Tk):
             self.show_entered(job)
             self.clear_alert("excel")
             self.clear_alert("fullblock")
-            self.ticket_done()
+            self.ticket_done(receipt)
             self.refresh_blocks(announce=True)
             self._entered_msg = f"Entered ticket {receipt.ticket}. Lift the slip - the next one is read automatically." + \
                 (f" {self.low_note}" if self.low_note else "")
@@ -1790,7 +1869,7 @@ class App(tk.Tk):
         t0 = time.perf_counter()
         try:
             try:
-                receipt = self.sink.write_row_fast(block, picks, final_name, ticket)
+                receipt = self.sink.write_row_fast(block, picks, final_name, ticket, or_next=self.ticket_follow)
             except SlotTaken as e:
                 if not messagebox.askyesno("Ticket already used", f"{e}\n\nOverwrite it?"):
                     return
@@ -1822,7 +1901,7 @@ class App(tk.Tk):
         self.last_var.set(f"Last entered: ticket {receipt.ticket}  {final_name}   {' '.join(shown)}")
         self._entered_msg = ""
         self.clear_card()
-        self.ticket_done()
+        self.ticket_done(receipt)
         self.refresh_blocks(announce=True)
         self.update_stats()
         self.next_backlog()
@@ -1960,7 +2039,7 @@ class App(tk.Tk):
         if self.rev_job is job:
             self.on_tree_select()
         job.reading = job.name_crop = job.crop_jpg = None
-        self.ticket_done()
+        self.ticket_done(freed=job.ticket)
         self.refresh_blocks()
         self.update_stats()
 

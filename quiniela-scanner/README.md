@@ -37,8 +37,10 @@ Try it with no camera first: `run.bat --demo path\to\photo-of-a-slip.jpg` loops 
 ## 3. How it finds your Excel sheet
 
 Nothing is hard-coded to column letters. On every sheet named `ENTRY*` it looks for a header row containing
-**`NOMBRE`** followed by **`1 2 3 4 5 6 7 8 9`**, with **`#`** (the ticket number) just left of `NOMBRE` – exactly like your
-`ENTRY PG1` sheet:
+**`NOMBRE`** followed by **`1 2 3 4 5 6 7 8 9`**, with the ticket number just left of `NOMBRE` – exactly like your
+`ENTRY PG1` sheet. That column is headed **`#`**, or has no header at all (the first block of your sheet, tickets 1-240): then
+it is found by the numbers `1, 2, 3 …` under the header. A block with no ticket numbers at all is filled by row instead, and an
+amber line says so:
 
 ```
  #  | NOMBRE      | 1 | 2 | … | 9 | T      ← header row (each block repeats this, side by side)
@@ -48,8 +50,14 @@ Nothing is hard-coded to column letters. On every sheet named `ENTRY*` it looks 
 * Each block it finds appears in the **Block** drop-down with its ticket range and how many tickets are still free
   (`run.bat excel` prints the same thing – a good first check that it understood your file).
 * It writes **name + picks 1–9 only**. `T` and everything else is left alone.
-* Target = the **first free ticket** (empty name and empty picks) in the selected block. Type a **Ticket #** to override
-  (for that one slip).
+* Target = the **first free ticket** (empty name and empty picks) in the selected block (the window opens on the first
+  block that has room: ticket 1 on a fresh sheet).
+* **Start anywhere, continue from there.** Click a ticket or name cell in Excel at the row you want and press
+  **Start at the cell I clicked in Excel (F3)** (or just type a **Ticket #**). That slip goes there, and the slips after it
+  go to the next free tickets below it, in order - the box moves on by itself. A row that already has data is skipped, not
+  overwritten. **Undo** gives the ticket back. At the end of the block the app says so and the next slip goes to the block's
+  first free ticket; it never jumps to another block (that can be another group's). Choosing a block in the Block list starts
+  from that block's first free ticket again.
 * The sheets are read in full **once**, when you connect. After that every slip costs one small read of its target row
   (is it still that ticket, and still empty?) and one write, so Excel is never busy for long and rows you typed by hand in
   the meantime are never overwritten (the app moves on to the next free row). If rows were inserted or deleted above a block

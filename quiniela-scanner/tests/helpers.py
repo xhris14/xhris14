@@ -11,8 +11,11 @@ TEAMS = [("NECAXA", "ATLAS"), ("ATLANTE", "PUMAS"), ("TIJUANA", "PUEBLA"), ("CHI
          ("CRUZ AZUL", "JUAREZ"), ("MONTERREY", "PACHUCA")]
 
 
-def make_pool_workbook(path, filled=(10, 3, 0), first_tickets=(241, 481, 721), rows=52, suffixes=("RRR", "CH", "")):
-    """ENTRY PG1 with three side-by-side blocks:  # | NOMBRE | 1..9 | T   (header on row 4)."""
+def make_pool_workbook(path, filled=(10, 3, 0), first_tickets=(241, 481, 721), rows=52, suffixes=("RRR", "CH", ""),
+                       hash_headers=(True, True, True)):
+    """ENTRY PG1 with three side-by-side blocks:  # | NOMBRE | 1..9 | T   (header on row 4).
+    hash_headers[b] False leaves the '#' cell of block b empty (the ticket numbers are still there, like the first block
+    of the real sheet)."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "ENTRY PG1"
@@ -23,7 +26,8 @@ def make_pool_workbook(path, filled=(10, 3, 0), first_tickets=(241, 481, 721), r
     start_col = 13                              # column M, like the real sheet
     for b, (first, nfilled, suf) in enumerate(zip(first_tickets, filled, suffixes)):
         c0 = start_col + b * 12                 # '#', NOMBRE, 9 picks, T -> 12 columns
-        ws.cell(4, c0, "#")
+        if hash_headers[b]:
+            ws.cell(4, c0, "#")
         ws.cell(4, c0 + 1, "NOMBRE")
         for k in range(9):
             ws.cell(4, c0 + 2 + k, k + 1)

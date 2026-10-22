@@ -244,11 +244,22 @@ class BlockInfo:
     label: str
 
 
+def _counts_up(snap: Snapshot, row: int, col: int) -> bool:
+    """The cell at (row, col) and the one under it are ticket numbers one apart: 240, 241 / 1, 2."""
+    a, b = snap.get(row, col), snap.get(row + 1, col)
+    return is_ticket(a) and is_ticket(b) and b == a + 1
+
+
 def discover_blocks(sheet: str, snap: Snapshot, name_header: str = "NOMBRE",
-                    rows_without_tickets: int = 52, max_header_row: int = 500, skipped: list | None = None) -> list:
+                    rows_without_tickets: int | None = None, max_header_row: int = 500,
+                    skipped: list | None = None) -> list:
     """Every NOMBRE | 1..9 header of the snapshot as a Block. The ticket column below a header must hold real
     ticket numbers (is_ticket); the block ends at the first cell that does not. A header with no ticket number
-    under it is not a block - it is described in ``skipped`` (if given) so the caller can say why."""
+    under it is not a block - it is described in ``skipped`` (if given) so the caller can say why.
+
+    The ticket column is the one left of NOMBRE: headed '#' (or No / Ticket / Folio), or - for a block whose header
+    cell is empty - holding two ticket numbers one apart right under the header. A block without any ticket column
+    gets ``rows_without_tickets`` rows, by default as many as its ticketed neighbours on the sheet have (else 52)."""
     want = name_header.strip().upper()
     blocks = []
     last_hdr = min(snap.last_row, max_header_row)
@@ -260,7 +271,13 @@ def discover_blocks(sheet: str, snap: Snapshot, name_header: str = "NOMBRE",
             c = snap.left + k
             if any(str(snap.get(r, c + 1 + j)) != str(j + 1) for j in range(N_PICKS)):
                 continue
-            tc = c - 1 if str(snap.get(r, c - 1) or "").upper() in ("#", "NO", "NO.", "TICKET", "FOLIO") else None
+            left = c - 1
+            if str(snap.get(r, left) or "").upper() in ("#", "NO", "NO.", "TICKET", "FOLIO"):
+                tc = left
+            elif left >= snap.left and _counts_up(snap, r + 1, left):
+                tc = left                    # no '#' header (the first block of a sheet often has none), but 1, 2, 3 ... below it
+            else:
+                tc = None
             rows = []
             if tc is not None:
                 rr = r + 1
@@ -268,12 +285,22 @@ def discover_blocks(sheet: str, snap: Snapshot, name_header: str = "NOMBRE",
                     rows.append(rr)
                     rr += 1
             else:
-                rows = list(range(r + 1, r + 1 + rows_without_tickets))
+                rows = [-1]                  # (filled in below: it depends on the other blocks of the sheet)
             if rows:
                 blocks.append(Block(sheet, r, c, tc, rows, snap.get(rows[0], tc) if tc is not None else None))
             elif skipped is not None:
                 skipped.append(f"{sheet} column {col_letter(c)}: the header '{name_header}' at row {r} has no ticket "
                                f"number under it (row {r + 1} is {_show(snap.get(r + 1, tc))}) - block not used")
+    ticketed = [len(b.rows) for b in blocks if b.ticket_col is not None]
+    for b in blocks:
+        if b.ticket_col is None:
+            n = rows_without_tickets or max(ticketed, default=52)
+            b.rows = list(range(b.header_row + 1, b.header_row + 1 + n))
+            if ticketed and skipped is not None:
+                skipped.append(f"{sheet} column {col_letter(b.name_col)}: no ticket numbers found left of "
+                               f"'{name_header}' (the cells there are {_show(snap.get(b.header_row, b.name_col - 1))} and "
+                               f"{_show(snap.get(b.header_row + 1, b.name_col - 1))}) - entries go to the next free row "
+                               f"of rows {b.rows[0]}-{b.rows[-1]} instead of by ticket")
     return blocks
 
 
@@ -410,6 +437,10 @@ class OpenpyxlBackend:
         self._load_values()
         ws = self._wbv[sheet]
         return [ws.cell(row=row, column=col + i).value for i in range(n)]
+
+    def active_cell(self):
+        """A file has no selected cell."""
+        return None
 
     def font_sizes(self, sheet: str, row: int, col: int, n: int) -> list:
         self.calls["font_sizes"] += 1
@@ -653,6 +684,21 @@ class ComBackend:
             return (v + [None] * n)[:n]
         return self._retry(go)
 
+    def active_cell(self):
+        """(sheet, row, col) of the cell selected in THIS workbook's window; None when another workbook is in front
+        or nothing usable is selected (a chart, say)."""
+        self.calls["active_cell"] += 1
+
+        def go():
+            wb = self.app.ActiveWorkbook
+            if wb is None or str(wb.Name) != self.workbook_name:
+                return None
+            cell, ws = self.app.ActiveCell, self.app.ActiveSheet
+            if cell is None or ws is None:
+                return None
+            return str(ws.Name), int(cell.Row), int(cell.Column)
+        return self._retry(go)
+
     def font_sizes(self, sheet: str, row: int, col: int, n: int) -> list:
         self.calls["font_sizes"] += 1
 
@@ -887,6 +933,31 @@ class ExcelSink:
                 return info.first_free
         return None
 
+    def slot_at(self, sheet: str, row: int, col: int) -> Slot | None:
+        """The Slot (ticket row) of the block that covers this cell of the sheet - ticket, name, picks or T column -
+        or None when the cell is outside every block. Free or not."""
+        for b in self.blocks:
+            if b.sheet != sheet or row not in b.rows:
+                continue
+            if (b.ticket_col if b.ticket_col is not None else b.name_col) <= col <= b.name_col + N_PICKS + 1:
+                return Slot(b, row, self._ticket(b, row))
+        return None
+
+    def next_free_after(self, block: Block, row: int) -> Slot | None:
+        """The first free Slot of the block below ``row`` (cache only), None when nothing is left below it."""
+        b = self.resolve_block(block)
+        if b is None:
+            return None
+        snap = self.snaps[b.sheet]
+        r = next((r for r in b.rows if r > row and slot_is_free(snap, b, r)), None)
+        return Slot(b, r, self._ticket(b, r)) if r is not None else None
+
+    def active_cell(self):
+        """(sheet, row, col) of the cell selected in the workbook's Excel window, None if the backend cannot say
+        (file backend) or another workbook is in front."""
+        fn = getattr(self.backend, "active_cell", None)
+        return fn() if fn else None
+
     def slot_for_ticket(self, ticket: int) -> Slot | None:
         for b in self.blocks:
             for r in b.rows:
@@ -898,9 +969,9 @@ class ExcelSink:
         return slot_is_free(self.snaps[slot.block.sheet], slot.block, slot.row)
 
     # -- cache helpers (no COM) ---------------------------------------------
-    def _first_free_row(self, block: Block, skip=()):
+    def _first_free_row(self, block: Block, skip=(), after: int = 0):
         snap = self.snaps[block.sheet]
-        return next((r for r in block.rows if r not in skip and slot_is_free(snap, block, r)), None)
+        return next((r for r in block.rows if r > after and r not in skip and slot_is_free(snap, block, r)), None)
 
     def resolve_block(self, old: Block | None) -> Block | None:
         """The Block of the CURRENT cache that stands for `old`, a Block taken from an earlier refresh (e.g. the one
@@ -1008,12 +1079,14 @@ class ExcelSink:
                        warnings=warnings)
 
     def write_row_fast(self, block: Block | None, picks, name: str = "", ticket: int | None = None,
-                       allow_overwrite: bool = False) -> Receipt:
+                       allow_overwrite: bool = False, or_next: bool = False) -> Receipt:
         """Write name + 9 picks into the next free ticket of `block` (None = default block), or into the
         explicit `ticket`. Typical cost: one small read + one write, no full-sheet read; a font read/write
         is added only for boxes left empty. `name` may be '' (the cell stays empty; fill it in later with
         update_name). SlotTaken only for an explicit ticket that already has data (unless allow_overwrite);
         a free-looking slot that turns out to be taken is skipped. allow_overwrite does not apply to "next free".
+        or_next: an explicit ticket that has data is not an error - the next free ticket after it, in the same
+        block, is used ("continue from there"; BlockFull if nothing is free below it).
 
         An exception means NOTHING was entered (ExcelBusy: Excel was busy; BlockFull: no free ticket left in the
         block; ExcelError: anything else). Once the values are in the sheet the call returns: font size / Save
@@ -1021,17 +1094,21 @@ class ExcelSink:
         values, small = self._row_values(name, picks)
         block = getattr(block, "block", block)             # a BlockInfo works too
         if ticket is not None:
-            return self._write_ticket(block, ticket, values, small, allow_overwrite)
+            return self._write_ticket(block, ticket, values, small, allow_overwrite, or_next)
         return self._write_next_free(block, values, small)
 
-    def _write_next_free(self, block, values, small) -> Receipt:
+    def _write_next_free(self, block, values, small, after_ticket: int | None = None) -> Receipt:
+        """First free row of the block - below the row of ``after_ticket`` when that is given."""
         stale = False
         for attempt in (0, 1):
             b = self.resolve_block(block)
             skip = set()
             stale = False
+            after = 0
+            if after_ticket is not None and b is not None:
+                after = next((r for r in b.rows if self._ticket(b, r) == after_ticket), 0)
             for _ in range(MAX_PROBES):
-                row = self._first_free_row(b, skip) if b else None
+                row = self._first_free_row(b, skip, after) if b else None
                 if row is None:
                     break
                 slot = Slot(b, row, self._ticket(b, row))
@@ -1055,19 +1132,22 @@ class ExcelSink:
         snap = self.snaps[b.sheet]
         stop = _block_stop(snap, b, self.blocks)
         held = sorted({r for r, _ in _formula_cells(snap, b)})
-        why = "every row already has data" + (f" or a formula that shows nothing ({len(held)} row(s), first row "
+        why = (f"every row after ticket {after_ticket} already has data" if after_ticket is not None
+               else "every row already has data") + (f" or a formula that shows nothing ({len(held)} row(s), first row "
                                               f"{held[0]}; formulas are never overwritten)" if held else "")
         if stop:
             why += f"; {_stop_text(b, stop)}"
         raise BlockFull(f"no free ticket in block {b.sheet} column {col_letter(b.name_col)} ({span}): {why}", b)
 
-    def _write_ticket(self, block, ticket, values, small, allow_overwrite) -> Receipt:
+    def _write_ticket(self, block, ticket, values, small, allow_overwrite, or_next=False) -> Receipt:
         for attempt in (0, 1):
             slot = self._find_ticket(ticket, block)
             if slot is not None:
                 status, live = self._probe(slot)
                 if status == "ok" or (status == "taken" and allow_overwrite):
                     return self._commit(slot, live, values, small)
+                if status == "taken" and or_next:
+                    return self._write_next_free(slot.block, values, small, after_ticket=ticket)
                 if status == "taken":
                     raise SlotTaken(f"{slot.describe()} already has data")
             if attempt == 0:
