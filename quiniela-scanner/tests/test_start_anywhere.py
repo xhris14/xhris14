@@ -18,9 +18,9 @@ from quiniela_scanner import gui
 from quiniela_scanner.excel_sink import (BlockFull, ComBackend, ExcelSink, OpenpyxlBackend, SlotTaken, Snapshot,
                                          discover_blocks)
 
-env, readings = base.env, base.readings
+env, readings, flagged = base.env, base.readings, base.flagged
 mk2 = w.mk2
-inject, good, entered, named, settle = base.inject, base.good, base.entered, base.named, base.settle
+inject, good, entered, named, settle, pump = base.inject, base.good, base.entered, base.named, base.settle, base.pump
 ScriptedReader = base.ScriptedReader
 
 USER = dict(first_tickets=(1, 241, 481), hash_headers=(False, True, True), filled=(0, 0, 0), rows=30)
@@ -185,16 +185,137 @@ def test_a_cell_outside_every_block_changes_nothing(env, mk2):
     assert "Could not read the cell selected in Excel" in app.alert_var.get()
 
 
-def test_the_end_of_the_block_is_announced_and_nothing_jumps_to_another_block(env, mk2, readings):
+def test_the_end_of_a_run_holds_the_next_slip_instead_of_going_back_up(env, mk2, readings):
+    """Review: at the end of the block the run used to wrap silently to ticket 1 - into tickets the operator skipped."""
     reader = ScriptedReader()
     app, backend = mk2(reader=reader, wb=USER)
-    app.ticket_var.set("30")
-    inject(app, reader, readings[0], good("A"))
-    assert entered(app, 1) and app.entries[0].ticket == 30
-    assert "end of the block you started in" in app.notice_var.get()
-    assert not app.ticket_custom and app.ticket_var.get() == "1"                  # the block's own first free ticket
-    inject(app, reader, readings[1], good("B"))
-    assert entered(app, 2) and app.entries[1].ticket == 1 and "tickets 1-30" in app.block_var.get()
+    app.ticket_var.set("29")
+    for k in (0, 1):
+        inject(app, reader, readings[k], good(f"A{k}"))
+        assert entered(app, 1 + k)
+    assert [j.ticket for j in app.entries] == [29, 30]
+    assert "END OF YOUR RUN" in app.alert_var.get() and app._block_confirm and not app.ticket_custom
+    inject(app, reader, readings[2], good("B"))                                   # the next slip waits on the card
+    assert pump(app, lambda: app.pending is not None) and len(app.entries) == 2
+    assert "END OF YOUR RUN" in app.banner_var.get()
+    assert ticket_row(backend, 1)[1:] == [None] * 9
+    assert pump(app, lambda: app.name_var.get() == "B")
+    app.commit()                                                                  # Enter = "yes, the first free ticket"
+    assert len(app.entries) == 3 and app.entries[2].ticket == 1 and "tickets 1-30" in app.block_var.get()
+    assert app._block_confirm == "" and "END OF YOUR RUN" not in app.alert_var.get()
+
+
+def test_undo_of_the_last_slip_of_a_run_gives_its_ticket_back(env, mk2, readings):
+    reader = ScriptedReader()
+    app, backend = mk2(reader=reader, wb=USER)
+    app.ticket_var.set("28")
+    for k in range(3):
+        inject(app, reader, readings[k], good(f"A{k}"))
+        assert entered(app, 1 + k)
+    assert [j.ticket for j in app.entries] == [28, 29, 30] and app._block_confirm
+    app.undo_job(app.entries[2])                                                  # 30 was misread
+    assert app.ticket_var.get() == "30" and app.ticket_follow and not app._block_confirm
+    assert "END OF YOUR RUN" not in app.alert_var.get()
+    inject(app, reader, readings[3], good("B"))                                   # ... placed again: back into 30
+    assert entered(app, 4) and app.entries[3].ticket == 30
+
+
+def test_undo_of_an_older_slip_leaves_the_run_where_it_is(env, mk2, readings):
+    """Review: undoing an older entry moved the run back to it, and the stack then refilled the range it had skipped."""
+    reader = ScriptedReader()
+    app, backend = mk2(reader=reader, wb=USER)
+    inject(app, reader, readings[0], good("A"))                                   # ticket 1 (default)
+    assert entered(app, 1)
+    app.ticket_var.set("20")
+    for k in (1, 2):
+        inject(app, reader, readings[k], good(f"A{k}"))
+        assert entered(app, 1 + k)
+    assert [j.ticket for j in app.entries] == [1, 20, 21] and app.ticket_var.get() == "22"
+    app.undo_job(app.entries[0])
+    assert app.ticket_var.get() == "22" and app.ticket_follow
+    inject(app, reader, readings[3], good("B"))
+    assert entered(app, 4) and app.entries[3].ticket == 22
+
+
+def test_undo_in_another_block_never_moves_the_run_into_it(env, mk2, readings):
+    reader = ScriptedReader()
+    app, backend = mk2(reader=reader, wb=USER)
+    app.select_info(app.infos[1])                                                 # group B: tickets 241-270
+    for k in (0, 1):
+        inject(app, reader, readings[k], good(f"B{k}"))
+        assert entered(app, 1 + k)
+    app.select_info(app.infos[0])                                                 # group A starts at 10
+    app.ticket_var.set("10")
+    for k in (2, 3):
+        inject(app, reader, readings[k], good(f"A{k}"))
+        assert entered(app, 1 + k)
+    assert [j.ticket for j in app.entries] == [241, 242, 10, 11] and app.ticket_var.get() == "12"
+    app.undo_job(app.entries[0])                                                  # a mistake in group B's block
+    assert app.ticket_var.get() == "12" and "tickets 1-30" in app.block_var.get()
+    inject(app, reader, readings[4], good("A4"))
+    assert entered(app, 5) and app.entries[4].ticket == 12 and "tickets 1-30" in app.block_var.get()
+
+
+def test_undo_of_a_slip_from_the_previous_workbook_does_not_move_the_run(env, mk2, readings):
+    reader = ScriptedReader()
+    app, backend = mk2(reader=reader, wb=USER)
+    inject(app, reader, readings[0], good("OLD"))
+    assert entered(app, 1)
+    backend.workbook_name = "JORNADA 13 PC.xlsx"
+    app.connect_excel()
+    app.ticket_var.set("20")
+    inject(app, reader, readings[1], good("NEW"))
+    assert entered(app, 2) and app.entries[1].ticket == 20 and app.ticket_var.get() == "21"
+    app.undo_job(app.entries[0])                                                  # (its sink is the old connection)
+    assert app.ticket_var.get() == "21" and app.ticket_follow
+
+
+def test_a_continuing_write_never_lands_in_another_block(tmp_path):
+    sink, _ = user_sink(tmp_path)
+    b1 = sink.block_infos()[0].block
+    with pytest.raises(base.ExcelError, match="not in the selected block"):
+        sink.write_row_fast(b1, list("LEVLEVLEV"), "X", ticket=250, or_next=True)
+    assert sink.write_row_fast(b1, list("LEVLEVLEV"), "X", ticket=250).ticket == 250     # (a typed ticket may)
+
+
+def test_messages_about_a_start_go_away_once_they_mean_nothing(env, mk2, readings):
+    reader = ScriptedReader()
+    app, backend = mk2(reader=reader, wb=USER)
+    backend.active_cell = lambda: (_ for _ in ()).throw(base.ExcelError("Excel is busy"))
+    app.start_at_cell()
+    assert "Could not read the cell selected in Excel" in app.alert_var.get()
+    app.ticket_var.set("10")                                                      # the operator types instead
+    assert "Could not read" not in app.alert_var.get()
+    row = next(r for r in range(1, 60) if backend._wbv["ENTRY PG1"].cell(r, T_COL).value == 20)
+    backend.active_cell = lambda: ("ENTRY PG1", row, N_COL)
+    app.start_at_cell()
+    assert "Starting at ticket 20" in app.notice_var.get()
+    app.ticket_var.set("5")
+    assert "Starting at" not in app.notice_var.get()
+
+
+def test_the_start_button_does_not_teach_a_key_excel_would_get(env, mk2):
+    app, backend = mk2(reader=ScriptedReader(), wb=USER)
+    assert not app.bind_all("<F3>")
+    texts = []
+
+    def walk(w):
+        try:
+            texts.append(str(w.cget("text")))
+        except Exception:
+            pass
+        for c in w.winfo_children():
+            walk(c)
+    walk(app)
+    assert "Start at the cell I clicked in Excel" in texts and not any("F3" in t for t in texts)
+
+
+def test_the_previous_blocks_t_column_is_never_a_ticket_column():
+    """Review: NOMBRE|1..9|T|NOMBRE|1..9|T without '#': once T scored 4, 5 the second block took T as its tickets."""
+    hdr = (["NOMBRE"] + list(range(1, 10)) + ["T"]) * 2
+    vals = [hdr] + [["P"] + ["L"] * 9 + [4 + i] + [None] * 11 for i in range(2)] + [[None] * 22 for _ in range(10)]
+    blocks = discover_blocks("S", Snapshot(1, 1, vals))
+    assert [b.ticket_col for b in blocks] == [None, None]
 
 
 def test_a_ticket_typed_in_another_block_selects_that_block_and_continues_there(env, mk2, readings):
@@ -235,6 +356,46 @@ def test_an_upright_monitor_puts_the_card_under_the_picture_and_cuts_nothing_off
         assert w.winfo_rootx() - app.winfo_rootx() + w.winfo_width() <= W, name
     assert app.write_btn.winfo_rooty() > app.preview.winfo_rooty() + app.preview.winfo_height()     # the card is below
     assert not app._mid_sb.winfo_ismapped()                                         # and nothing needs scrolling
+    assert app.winfo_rootx() >= 0 and app.winfo_rootx() + app.winfo_width() <= sw - 16, app.wm_geometry()  # whole on screen
+
+
+def in_view(app, w):
+    c = app._mid_canvas
+    return c.winfo_rooty() <= w.winfo_rooty() and w.winfo_rooty() + w.winfo_height() <= c.winfo_rooty() + c.winfo_height()
+
+
+def test_on_a_short_upright_screen_a_card_to_check_is_scrolled_into_view(env, mk2, monkeypatch, flagged):
+    """Review: stacked, a card opened scrolled to the TOP (the camera picture): its last rows and Write were hidden."""
+    monkeypatch.setattr(gui.App, "_screen", lambda self: (900, 1250, 1.0))
+    app, backend = mk2(reader=ScriptedReader(), wb=USER)
+    app.notice("CAMERA IS SLOW (under 20 pictures per second): slips may be missed.", "fps")
+    app.alert("one red line", "excel", beep=False)
+    settle(app, 0.3)
+    assert app.stacked
+    inject(app, None, flagged)
+    assert pump(app, lambda: app.pending is not None)
+    settle(app, 0.3)
+    assert app._mid_scrolls() and app._mid_sb.winfo_ismapped() and app._mid_sb.winfo_width() > 5
+    assert in_view(app, app.write_btn) and all(in_view(app, r[0]) for r in app.pick_radios)
+    app.discard()
+    settle(app, 0.2)
+    assert app._mid_canvas.yview()[0] == 0.0                                       # back to the camera picture
+
+
+def test_a_narrow_landscape_screen_keeps_a_working_scrollbar(env, mk2, monkeypatch, flagged):
+    """Review: side by side on a narrow screen the scrollbar was packed after the canvas and got 0 px: nothing scrolled."""
+    monkeypatch.setattr(gui.App, "_screen", lambda self: (1100, 640, 1.0))
+    app, backend = mk2(reader=ScriptedReader(), wb=USER)
+    app.alert("one red line", "excel", beep=False)
+    app.alert("another red line", "block", beep=False)
+    inject(app, None, flagged)
+    assert pump(app, lambda: app.pending is not None)
+    settle(app, 0.3)
+    assert app.narrow and not app.stacked and app._mid_scrolls()
+    assert app._mid_sb.winfo_ismapped() and app._mid_sb.winfo_width() > 5
+    app._mid_canvas.yview_moveto(1.0)
+    settle(app, 0.1)
+    assert in_view(app, app.write_btn)
 
 
 def test_a_wide_screen_keeps_the_side_by_side_layout(env, mk2, monkeypatch):

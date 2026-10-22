@@ -52,12 +52,13 @@ amber line says so:
 * It writes **name + picks 1–9 only**. `T` and everything else is left alone.
 * Target = the **first free ticket** (empty name and empty picks) in the selected block (the window opens on the first
   block that has room: ticket 1 on a fresh sheet).
-* **Start anywhere, continue from there.** Click a ticket or name cell in Excel at the row you want and press
-  **Start at the cell I clicked in Excel (F3)** (or just type a **Ticket #**). That slip goes there, and the slips after it
-  go to the next free tickets below it, in order - the box moves on by itself. A row that already has data is skipped, not
-  overwritten. **Undo** gives the ticket back. At the end of the block the app says so and the next slip goes to the block's
-  first free ticket; it never jumps to another block (that can be another group's). Choosing a block in the Block list starts
-  from that block's first free ticket again.
+* **Start anywhere, continue from there.** Click a ticket or name cell in Excel at the row you want, then click the
+  button **Start at the cell I clicked in Excel** in the scanner window (or just type a **Ticket #**). That slip goes there,
+  and the slips after it go to the next free tickets below it, in order - the box moves on by itself. A row that already
+  has data is skipped, not overwritten. **Undo** of the slip just entered gives its ticket back (an older one leaves the
+  run where it is). When the run reaches the end of the block, the next slip **waits on the card** with a red line:
+  Enter writes it to the block's first free ticket, or start somewhere else. It never goes to another block by itself
+  (that can be another group's). Choosing a block in the Block list starts from that block's first free ticket again.
 * The sheets are read in full **once**, when you connect. After that every slip costs one small read of its target row
   (is it still that ticket, and still empty?) and one write, so Excel is never busy for long and rows you typed by hand in
   the meantime are never overwritten (the app moves on to the next free row). If rows were inserted or deleted above a block
