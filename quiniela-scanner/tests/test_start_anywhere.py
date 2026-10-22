@@ -14,6 +14,7 @@ import pytest
 import test_pipeline_gui as base
 import test_wiring as w
 from helpers import make_pool_workbook
+from quiniela_scanner import gui
 from quiniela_scanner.excel_sink import (BlockFull, ComBackend, ExcelSink, OpenpyxlBackend, SlotTaken, Snapshot,
                                          discover_blocks)
 
@@ -203,3 +204,42 @@ def test_a_ticket_typed_in_another_block_selects_that_block_and_continues_there(
     inject(app, reader, readings[0], good("A"))
     assert entered(app, 1) and app.entries[0].ticket == 250
     assert "tickets 241-270" in app.block_var.get() and app.ticket_var.get() == "251" and app.ticket_follow
+
+
+def test_another_workbook_does_not_inherit_the_chosen_start(env, mk2, readings):
+    reader = ScriptedReader()
+    app, backend = mk2(reader=reader, wb=USER)
+    app.ticket_var.set("10")
+    inject(app, reader, readings[0], good("A"))
+    assert entered(app, 1) and app.ticket_var.get() == "11" and app.ticket_follow
+    app.connect_excel()                                                           # the same workbook: the start is kept
+    assert app.ticket_var.get() == "11" and app.ticket_follow
+    backend.workbook_name = "JORNADA 13 PC.xlsx"                                  # next jornada: start from its first free ticket
+    app.connect_excel()
+    assert app.ticket_var.get() == "1" and not app.ticket_custom and not app.ticket_follow
+
+
+# ======================================================================================= an upright (portrait) monitor
+@pytest.mark.parametrize("sw,sh,scale", [(1080, 1920, 1.0), (1080, 1920, 1.25)])
+def test_an_upright_monitor_puts_the_card_under_the_picture_and_cuts_nothing_off(env, mk2, monkeypatch, sw, sh, scale):
+    """The user's monitor stands upright (1080 px wide): the side-by-side layout needed 1214 px, so both edges were cut."""
+    monkeypatch.setattr(gui.App, "_screen", lambda self: (sw, sh, scale))
+    app, backend = mk2(reader=ScriptedReader(), wb=USER, wbname="JORNADA 3 CLAUSURA 2026.xlsx")
+    settle(app, 0.4)
+    W = app.winfo_width()
+    assert app.narrow and app.stacked and W <= sw - 20 and app.winfo_reqwidth() <= W, (W, app.winfo_reqwidth())
+    for name in ("tree", "undo_btn", "review_btn", "name_entry", "block_cb", "ticket_entry", "excel_lbl", "write_btn",
+                 "preview", "stats_lbl"):
+        w = getattr(app, name)
+        assert w.winfo_viewable(), name
+        assert w.winfo_rootx() - app.winfo_rootx() + w.winfo_width() <= W, name
+    assert app.write_btn.winfo_rooty() > app.preview.winfo_rooty() + app.preview.winfo_height()     # the card is below
+    assert not app._mid_sb.winfo_ismapped()                                         # and nothing needs scrolling
+
+
+def test_a_wide_screen_keeps_the_side_by_side_layout(env, mk2, monkeypatch):
+    monkeypatch.setattr(gui.App, "_screen", lambda self: (1920, 1080, 1.0))
+    app, backend = mk2(reader=ScriptedReader(), wb=USER)
+    settle(app, 0.2)
+    assert not app.narrow and not app.stacked
+    assert app.write_btn.winfo_rootx() >= app.preview.winfo_rootx() + app.preview.winfo_width()       # side by side

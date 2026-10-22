@@ -197,6 +197,8 @@ class App(tk.Tk):
         self.title("Quiniela Scanner")
         sw, sh, dpi = self._screen()
         self.compact = sh / dpi < 900                # small screen (1366x768, 150% DPI on 1080p ...): denser layout
+        self.narrow = sw / dpi < 1280                # an upright (portrait) monitor or a small one: narrower boxes ...
+        self.stacked = self.narrow and sh / dpi >= 1500     # ... and, with height to spare, the card under the picture
         self.preview_w = 360 if self.compact else PREVIEW_W
         self.slip_box = (200, 215) if self.compact else (310, 325)       # max size of the slip picture on the card
         self.rev_w = 300 if self.compact else 460                       # ... and of the picture in the review panel
@@ -311,8 +313,9 @@ class App(tk.Tk):
         self._sync_mid()
         self.update_idletasks()
         room = 0 if self.compact else 140            # room for the alert strip (on a small screen the middle scrolls instead)
-        self.geometry(f"{min(max(1240, self.winfo_reqwidth()), sw - 20)}x"
-                      f"{min(max(840 if not self.compact else 0, self.winfo_reqheight() + room), sh - self._margin_h(dpi))}")
+        w = min(max(0 if self.narrow else 1240, self.winfo_reqwidth()), sw - 20)
+        h = min(max(840 if not self.compact else 0, self.winfo_reqheight() + room), sh - self._margin_h(dpi))
+        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+0")         # (placed: never partly off the screen)
         self.start_camera()
         self._tick_id = self.after(TICK_MS, self.tick)
 
@@ -350,16 +353,21 @@ class App(tk.Tk):
         ttk.Checkbutton(bar, text="Autofocus", variable=self.af_var, command=self.apply_focus).pack(side="left", padx=8)
         ttk.Label(bar, text="Focus").pack(side="left")
         self.focus_var = tk.IntVar(value=int(self.cfg.manual_focus))
-        self.focus_scale = tk.Scale(bar, from_=0, to=255, resolution=5, orient="horizontal", length=120,
+        self.focus_scale = tk.Scale(bar, from_=0, to=255, resolution=5, orient="horizontal", length=90 if self.narrow else 120,
                                     showvalue=True, variable=self.focus_var, command=self.on_focus_move,
                                     highlightthickness=0, borderwidth=0, takefocus=0)
         self.focus_scale.pack(side="left", padx=4)
         self._focus_state()
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        if self.narrow:                                    # (the workbook name is long: on a narrow screen it gets its own row)
+            xbar = ttk.Frame(self)
+            xbar.pack(fill="x", **pad)
+        else:
+            xbar = bar
+            ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         self.excel_var = tk.StringVar(value="Excel: not connected")
-        self.excel_lbl = ttk.Label(bar, textvariable=self.excel_var, font=(FONT, 10, "bold"))
+        self.excel_lbl = ttk.Label(xbar, textvariable=self.excel_var, font=(FONT, 10, "bold"))
         self.excel_lbl.pack(side="left")
-        ttk.Button(bar, text="Connect / reconnect Excel", command=self.connect_excel).pack(side="left", padx=8)
+        ttk.Button(xbar, text="Connect / reconnect Excel", command=self.connect_excel).pack(side="left", padx=8)
 
         # ----- loud message strip (Excel trouble, circuit breaker); only shown while there is something to say
         self.alert_var = tk.StringVar()
@@ -387,7 +395,7 @@ class App(tk.Tk):
         self.block_lbl.grid(row=0, column=0, **pad)
         self._block_fg = style.lookup("TLabel", "foreground") or "black"
         self.block_var = tk.StringVar()
-        self.block_cb = ttk.Combobox(tgt, textvariable=self.block_var, state="readonly", width=58)
+        self.block_cb = ttk.Combobox(tgt, textvariable=self.block_var, state="readonly", width=44 if self.narrow else 58)
         self.block_cb.grid(row=0, column=1, **pad)
         self.block_cb.bind("<<ComboboxSelected>>", lambda e: self.on_block_change())
         ttk.Label(tgt, text="Ticket #:").grid(row=0, column=2, **pad)
@@ -404,8 +412,8 @@ class App(tk.Tk):
         startrow = ttk.Frame(tgt)
         startrow.grid(row=2, column=1, columnspan=4, sticky="w", **pad)
         ttk.Button(startrow, text="Start at the cell I clicked in Excel  (F3)", command=self.start_at_cell).pack(side="left")
-        ttk.Label(startrow, text="  or type a ticket number above - the slips that follow continue from it.",
-                  font=(FONT, 10)).pack(side="left")
+        ttk.Label(startrow, text="  or type a ticket number above" +
+                  ("." if self.narrow else " - the slips that follow continue from it."), font=(FONT, 10)).pack(side="left")
 
         # group tag: letters like "RRR" or "E" added before/after every name, switched on/off as you go
         ttk.Label(tgt, text="Group tag:").grid(row=1, column=0, **pad)
@@ -426,8 +434,12 @@ class App(tk.Tk):
         for v in (self.tag_var, self.tag_pos, self.tag_on):
             v.trace_add("write", lambda *a: self.on_tag_change())
         self.jornada_var = tk.StringVar()                  # whether the wrong-jornada guard is on (see expected_jornada)
-        self.jornada_lbl = ttk.Label(tagrow, textvariable=self.jornada_var, font=(FONT, 10, "bold"))
-        self.jornada_lbl.pack(side="left", padx=10)
+        if self.narrow:                                    # (no room left in the tag row)
+            self.jornada_lbl = ttk.Label(tgt, textvariable=self.jornada_var, font=(FONT, 10, "bold"))
+            self.jornada_lbl.grid(row=3, column=1, columnspan=4, sticky="w", **pad)
+        else:
+            self.jornada_lbl = ttk.Label(tagrow, textvariable=self.jornada_var, font=(FONT, 10, "bold"))
+            self.jornada_lbl.pack(side="left", padx=10)
 
         # ----- main: preview | card. On a screen that is too small for it the middle scrolls; the strip and the
         # history below it are packed first (side="bottom") so they always keep their room.
@@ -443,7 +455,10 @@ class App(tk.Tk):
         main.bind("<Configure>", lambda e: self._sync_mid())
         self._mid_canvas.bind("<Configure>", lambda e: self._sync_mid())
         left = ttk.Frame(main)
-        left.pack(side="left", fill="y", padx=4)
+        if self.stacked:
+            left.pack(side="top", anchor="w", padx=4)
+        else:
+            left.pack(side="left", fill="y", padx=4)
         self.preview = ttk.Label(left)
         self.preview.pack()
         self._prev_photo = ImageTk.PhotoImage(Image.new("RGB", (self.preview_w, round(self.preview_w * 9 / 16)), (236, 236, 236)))
@@ -479,7 +494,7 @@ class App(tk.Tk):
         self.rev_undo.grid(row=2, column=2, padx=2)
 
         card = ttk.LabelFrame(main, text="Scanned slip", style="Card.TLabelframe")
-        card.pack(side="left", fill="both", expand=True, padx=8)
+        card.pack(side="top" if self.stacked else "left", fill="both", expand=True, padx=8, pady=(8, 0) if self.stacked else 0)
         self.banner_var = tk.StringVar()
         self.banner = tk.Label(card, textvariable=self.banner_var, font=(FONT, 14, "bold"), anchor="w", padx=8)
         self.banner.grid(row=0, column=0, columnspan=3, sticky="we", padx=6, pady=(2, 4))
@@ -491,7 +506,8 @@ class App(tk.Tk):
         ttk.Label(card, text="Name:", font=(FONT, 11, "bold")).grid(row=2, column=1, sticky="e")
         self.name_var = tk.StringVar()
         self.name_var.trace_add("write", lambda *a: self.update_final())
-        self.name_entry = ttk.Entry(card, textvariable=self.name_var, font=(FONT, 16, "bold"), width=17)
+        self.name_entry = ttk.Entry(card, textvariable=self.name_var, font=(FONT, 16, "bold"),
+                                    width=13 if self.narrow and not self.stacked else 17)
         self.name_entry.grid(row=2, column=2, sticky="w", **pad)
         self.name_entry.bind("<Key>", self.on_name_key)
         self.name_note = tk.StringVar()
@@ -545,7 +561,7 @@ class App(tk.Tk):
         self._mid.pack(fill="both", expand=True, **pad)
         cols = ("time", "ticket", "name", "picks", "status")
         self.tree = ttk.Treeview(hist, columns=cols, show="headings", height=self.tree_rows)
-        for c, w in zip(cols, (80, 60, 210, 210, 400)):
+        for c, w in zip(cols, (80, 60, 210, 210, 290 if self.narrow else 400)):
             self.tree.heading(c, text=c.title())
             self.tree.column(c, width=w, anchor="w")
         self.tree.tag_configure("undone", foreground="#999")
@@ -807,6 +823,9 @@ class App(tk.Tk):
         self.show_layout_warnings()
         if select_default or self.sel_block is None:
             chosen = self.sink.default_block()
+            if select_default:                            # (another workbook: a start chosen in the old one means nothing here)
+                self.ticket_custom = self.ticket_follow = False
+                self.clear_notice("startcell")
         else:
             old = self.sel_block
             rb = self.sink.resolve_block(old)
