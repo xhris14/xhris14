@@ -250,7 +250,7 @@ run.bat cameras                  list webcams
 | names show `?` | open the red rows in the list and type them; `scanner.log` has the reason (no internet, timeout, ...). Many in a row = the red bar "NAME READING IS NOT WORKING" (§5): check the key / credit / internet |
 | red bar "N slips are WAITING behind the card" | finish the open card (Enter / Esc): the waiting slips are entered right after, in order |
 | red bar "AUDIT LOG PROBLEM" | `scans/log.csv` is open in Excel or the disk is full; rows go to `log-<time>.csv`, the slips are in your workbook anyway |
-| the window did not fit my screen | it adapts to 1366x768 and up; the middle part scrolls if needed (mouse wheel) |
+| the window did not fit my screen | it adapts to 1366x768 and up, and to an upright (portrait) monitor 1080 px wide: there the slip card goes under the camera picture; the middle part scrolls if needed (mouse wheel) |
 | it feels slow | look at `scanner.log` (`read_ms`, `excel_ms`, `name_ms`, `ui_ms`) or the strip under the preview |
 
 ## 9. What was tested, and what was not
