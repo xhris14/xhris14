@@ -258,7 +258,8 @@ def discover_blocks(sheet: str, snap: Snapshot, name_header: str = "NOMBRE",
     under it is not a block - it is described in ``skipped`` (if given) so the caller can say why.
 
     The ticket column is the one left of NOMBRE: headed '#' (or No / Ticket / Folio), or - for a block whose header
-    cell is empty - holding two ticket numbers one apart right under the header. A block without any ticket column
+    cell is empty - holding two ticket numbers one apart right under the header (a header cell with any text, e.g. the
+    'T' of the block before, is never taken: its scores can count up too). A block without any ticket column
     gets ``rows_without_tickets`` rows, by default as many as its ticketed neighbours on the sheet have (else 52)."""
     want = name_header.strip().upper()
     blocks = []
@@ -274,8 +275,8 @@ def discover_blocks(sheet: str, snap: Snapshot, name_header: str = "NOMBRE",
             left = c - 1
             if str(snap.get(r, left) or "").upper() in ("#", "NO", "NO.", "TICKET", "FOLIO"):
                 tc = left
-            elif left >= snap.left and _counts_up(snap, r + 1, left):
-                tc = left                    # no '#' header (the first block of a sheet often has none), but 1, 2, 3 ... below it
+            elif left >= snap.left and _blank_value(snap.get(r, left)) and _counts_up(snap, r + 1, left):
+                tc = left                    # an EMPTY header cell (the first block of a sheet often has no '#'), 1, 2, 3 ... below it
             else:
                 tc = None
             rows = []
@@ -1141,7 +1142,7 @@ class ExcelSink:
 
     def _write_ticket(self, block, ticket, values, small, allow_overwrite, or_next=False) -> Receipt:
         for attempt in (0, 1):
-            slot = self._find_ticket(ticket, block)
+            slot = self._find_ticket(ticket, block, only=or_next)     # (continuing: never in another block - another group)
             if slot is not None:
                 status, live = self._probe(slot)
                 if status == "ok" or (status == "taken" and allow_overwrite):
@@ -1152,17 +1153,21 @@ class ExcelSink:
                     raise SlotTaken(f"{slot.describe()} already has data")
             if attempt == 0:
                 self.refresh()
+        if or_next and block is not None:
+            raise ExcelError(f"ticket {ticket} is not in the selected block (any more) - pick the block or the ticket again")
         raise ExcelError(f"ticket {ticket} is not in the sheet (or its row keeps moving)")
 
-    def _slots_for_ticket(self, ticket: int, block: Block | None = None):
+    def _slots_for_ticket(self, ticket: int, block: Block | None = None, only: bool = False):
+        """Slots holding ``ticket``: in ``block`` first, then in the other blocks - unless ``only`` (and a block is given)."""
         first = self.resolve_block(block) if block is not None else None
-        for b in ([first] if first else []) + [b for b in self.blocks if b is not first]:
+        others = [] if only and block is not None else [b for b in self.blocks if b is not first]
+        for b in ([first] if first else []) + others:
             for r in b.rows:
                 if self._ticket(b, r) == ticket:
                     yield Slot(b, r, ticket)
 
-    def _find_ticket(self, ticket: int, block: Block | None = None) -> Slot | None:
-        return next(self._slots_for_ticket(ticket, block), None)
+    def _find_ticket(self, ticket: int, block: Block | None = None, only: bool = False) -> Slot | None:
+        return next(self._slots_for_ticket(ticket, block, only), None)
 
     def write(self, slot: Slot, name: str, picks: list, allow_overwrite: bool = False) -> Receipt:
         """Backwards-compatible: write into this slot (verified live, SlotTaken if it has data)."""

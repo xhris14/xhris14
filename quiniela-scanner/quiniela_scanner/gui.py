@@ -198,7 +198,7 @@ class App(tk.Tk):
         sw, sh, dpi = self._screen()
         self.compact = sh / dpi < 900                # small screen (1366x768, 150% DPI on 1080p ...): denser layout
         self.narrow = sw / dpi < 1280                # an upright (portrait) monitor or a small one: narrower boxes ...
-        self.stacked = self.narrow and sh / dpi >= 1500     # ... and, with height to spare, the card under the picture
+        self.stacked = self.narrow and sh > sw      # ... and on an upright screen the card goes under the picture
         self.preview_w = 360 if self.compact else PREVIEW_W
         self.slip_box = (200, 215) if self.compact else (310, 325)       # max size of the slip picture on the card
         self.rev_w = 300 if self.compact else 460                       # ... and of the picture in the review panel
@@ -240,6 +240,8 @@ class App(tk.Tk):
         self.sel_key: str | None = None
         self.ticket_custom = False        # the Ticket box holds the operator's choice (typed, or the cell clicked in Excel)
         self.ticket_follow = False        # ... and it is a place to continue from: taken -> the next free ticket after it
+        self._range_end = None            # Receipt of the slip that used up a chosen run at the end of its block
+        self._confirm_banner = ""         # card banner while _block_confirm holds the stack
         self._ticket_prog = False         # ticket_var is being set by the program, not typed
         self.breaker = ""                 # message while auto-enter is switched off by the circuit breaker
         self._alerts: dict = {}           # kind -> message of every alert that is up (insertion ordered)
@@ -294,7 +296,6 @@ class App(tk.Tk):
         self.bind_all("<Return>", self._on_return)
         self.bind_all("<Escape>", self._on_escape)
         self.bind_all("<F2>", lambda e: self.tag_on.set(not self.tag_on.get()))
-        self.bind_all("<F3>", lambda e: self.start_at_cell())
         self.bind("<Configure>", self._on_resize)
         self.bind_all("<MouseWheel>", self._on_wheel)
         self.bind_all("<Button-4>", self._on_wheel)
@@ -313,9 +314,12 @@ class App(tk.Tk):
         self._sync_mid()
         self.update_idletasks()
         room = 0 if self.compact else 140            # room for the alert strip (on a small screen the middle scrolls instead)
-        w = min(max(0 if self.narrow else 1240, self.winfo_reqwidth()), sw - 20)
-        h = min(max(840 if not self.compact else 0, self.winfo_reqheight() + room), sh - self._margin_h(dpi))
-        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+0")         # (placed: never partly off the screen)
+        sbw = self._mid_sb.winfo_reqwidth()          # (the middle's scrollbar must find room when it shows up)
+        w = min(max(0 if self.narrow else 1240, self.winfo_reqwidth() + sbw, self.wm_minsize()[0]), sw - 20)
+        h = sh - self._margin_h(dpi) if self.stacked else \
+            min(max(840 if not self.compact else 0, self.winfo_reqheight() + room), sh - self._margin_h(dpi))
+        x = max(0, min((sw - w) // 2, sw - w - 16))  # (placed whole on the screen; 16 = the frame Windows adds)
+        self.geometry(f"{w}x{h}+{x}+0")
         self.start_camera()
         self._tick_id = self.after(TICK_MS, self.tick)
 
@@ -411,7 +415,7 @@ class App(tk.Tk):
         ttk.Label(tgt, text="Start here:").grid(row=2, column=0, **pad)
         startrow = ttk.Frame(tgt)
         startrow.grid(row=2, column=1, columnspan=4, sticky="w", **pad)
-        ttk.Button(startrow, text="Start at the cell I clicked in Excel  (F3)", command=self.start_at_cell).pack(side="left")
+        ttk.Button(startrow, text="Start at the cell I clicked in Excel", command=self.start_at_cell).pack(side="left")
         ttk.Label(startrow, text="  or type a ticket number above" +
                   ("." if self.narrow else " - the slips that follow continue from it."), font=(FONT, 10)).pack(side="left")
 
@@ -478,6 +482,7 @@ class App(tk.Tk):
         ttk.Label(left, textvariable=self.hint_var, foreground="#555", wraplength=self.preview_w).pack(anchor="w")
         rev = ttk.LabelFrame(left, text="Selected entry  (click a row of the list below)")
         rev.pack(anchor="w", fill="x", pady=(4 if self.compact else 10, 0))
+        self._rev = rev
         self.rev_img = ttk.Label(rev)
         self.rev_img.grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.rev_info = tk.StringVar()
@@ -493,7 +498,7 @@ class App(tk.Tk):
         self.rev_undo = ttk.Button(rev, text="Undo this entry", command=self.undo_selected)
         self.rev_undo.grid(row=2, column=2, padx=2)
 
-        card = ttk.LabelFrame(main, text="Scanned slip", style="Card.TLabelframe")
+        card = self._card = ttk.LabelFrame(main, text="Scanned slip", style="Card.TLabelframe")
         card.pack(side="top" if self.stacked else "left", fill="both", expand=True, padx=8, pady=(8, 0) if self.stacked else 0)
         self.banner_var = tk.StringVar()
         self.banner = tk.Label(card, textvariable=self.banner_var, font=(FONT, 14, "bold"), anchor="w", padx=8)
@@ -597,22 +602,44 @@ class App(tk.Tk):
         rw, rh = main.winfo_reqwidth(), main.winfo_reqheight()
         c.configure(width=rw, height=rh, scrollregion=(0, 0, max(rw, c.winfo_width()), rh))
         c.itemconfigure(self._mid_win, width=max(rw, c.winfo_width()))
-        need = c.winfo_height() > 1 and rh > c.winfo_height() + 1
-        if need and not self._mid_sb.winfo_ismapped():
-            self._mid_sb.pack(side="right", fill="y")
-        elif not need and self._mid_sb.winfo_ismapped():
+        need = self._mid_scrolls()
+        if need and not self._mid_sb.winfo_manager():
+            self._mid_sb.pack(side="right", fill="y", before=c)     # (before the canvas: it must never be squeezed to 0 px)
+        elif not need and self._mid_sb.winfo_manager():
             self._mid_sb.pack_forget()
             c.yview_moveto(0)
 
+    def _mid_scrolls(self) -> bool:
+        """The middle holds more than it shows."""
+        c = self._mid_canvas
+        return c.winfo_height() > 1 and self._main.winfo_reqheight() > c.winfo_height() + 1
+
     def scroll_mid(self, bottom: bool):
-        """On a small screen the middle scrolls: show its bottom (the review panel) or its top (the card, the banner)."""
-        if self._mid_sb.winfo_ismapped():
-            self.update_idletasks()                       # (the content may just have grown: take its new size first)
-            self._sync_mid()
+        """When the middle scrolls: show the review panel (bottom=True) or the card. Side by side the card is at the top
+        and the review panel at the bottom; on an upright screen (stacked) the card is under the picture."""
+        self.update_idletasks()                           # (the content may just have grown: take its new size first)
+        self._sync_mid()
+        if not self._mid_scrolls():
+            return
+        if self.stacked:
+            self._see(self._rev if bottom else self._card)
+        else:
             self._mid_canvas.yview_moveto(1.0 if bottom else 0.0)
 
+    def _see(self, w):
+        """Scroll the middle as little as possible to show widget ``w`` (its top, if it is taller than the view)."""
+        c, main = self._mid_canvas, self._main
+        total = max(1, main.winfo_reqheight())
+        y, hgt, view = w.winfo_rooty() - main.winfo_rooty(), w.winfo_height(), c.winfo_height()
+        top = c.yview()[0] * total
+        if y + hgt > top + view:
+            top = y + hgt - view
+        if y < top:
+            top = y
+        c.yview_moveto(max(0.0, top / total))
+
     def _on_wheel(self, e):
-        if not self._mid_sb.winfo_ismapped():
+        if not self._mid_scrolls():
             return
         w = self.winfo_containing(e.x_root, e.y_root)
         if w is None or not str(w).startswith(str(self._mid_canvas)):
@@ -825,7 +852,9 @@ class App(tk.Tk):
             chosen = self.sink.default_block()
             if select_default:                            # (another workbook: a start chosen in the old one means nothing here)
                 self.ticket_custom = self.ticket_follow = False
+                self._range_end = None
                 self.clear_notice("startcell")
+                self.clear_alert("startcell")
         else:
             old = self.sel_block
             rb = self.sink.resolve_block(old)
@@ -848,6 +877,9 @@ class App(tk.Tk):
         if not self._ticket_prog:
             self.ticket_custom = True
             self.ticket_follow = False                    # a typed ticket is exact: a used one is refused, not skipped
+            self._range_end = None
+            self.clear_notice("startcell")                # (an earlier 'Starting at ...' or a failed start says nothing now)
+            self.clear_alert("startcell")
 
     def set_ticket_text(self, text: str):
         self._ticket_prog = True
@@ -866,37 +898,68 @@ class App(tk.Tk):
             self.set_ticket_text(str(slot.ticket) if slot and slot.ticket is not None else "")
         self.check_stock(info, announce)
 
-    def ticket_done(self, receipt: Receipt | None = None, freed: int | None = None):
-        """A write (or an undo) used up the ticket box. Normally it goes back to the suggestion for the next slip. A place
-        the operator chose (a typed ticket, the cell clicked in Excel) is where the stack CONTINUES: the box moves on to
-        the next free ticket of that block after a write, and back to the freed ticket after an undo."""
-        chosen = self.ticket_custom and self.sink is not None
+    def ticket_done(self, receipt: Receipt | None = None):
+        """A write used up the ticket box. Normally it goes back to the suggestion for the next slip. A place the operator
+        chose (a typed ticket, the cell clicked in Excel) is where the stack CONTINUES: the box moves on to the next free
+        ticket of that block. When the block has nothing free below it, the run is over: the next slip is held (red bar,
+        card) instead of going back up into tickets the operator skipped."""
+        chosen = self.ticket_custom and self.sink is not None and receipt is not None
         self.ticket_custom = self.ticket_follow = False
+        self._range_end = None
         self.clear_notice("startcell")
+        self.clear_alert("startcell")
         if not chosen:
             return
-        if freed is not None:
-            self.continue_at(freed)
-        elif receipt is not None:
-            blk = receipt.slot.block
-            nxt = self.sink.next_free_after(blk, receipt.row)
-            if self.sink.resolve_block(self.sel_block) is not self.sink.resolve_block(blk):    # (typed a ticket of another block)
-                self.infos = self.sink.block_infos()
-                info = next((i for i in self.infos if i.block.key == blk.key), None)
-                if info is not None:
-                    self.select_info(info)
-            if nxt is not None and nxt.ticket is not None:
-                self.continue_at(nxt.ticket)
-            else:
-                self.notice("You reached the end of the block you started in. The next slip goes to the first free ticket of "
-                            "this block - or click another row in Excel and press F3.", "startcell")
+        blk = receipt.slot.block
+        if self.sink.resolve_block(self.sel_block) is not self.sink.resolve_block(blk):    # (typed a ticket of another block)
+            self.infos = self.sink.block_infos()
+            info = next((i for i in self.infos if i.block.key == blk.key), None)
+            if info is not None:
+                self.select_info(info)
+        nxt = self.sink.next_free_after(blk, receipt.row)
+        if nxt is not None and nxt.ticket is not None:
+            self.continue_at(nxt.ticket)
+            return
+        self._range_end = receipt
+        first = self.sink.next_slot(blk)
+        if first is None:                                 # the block is full: block_full() takes the next slip
+            return
+        self._block_confirm = self.block_var.get() or "range"
+        self._confirm_banner = "CHECK THIS SLIP - END OF YOUR RUN, see the red bar"
+        where = f"ticket {first.ticket}" if first.ticket is not None else f"row {first.row}"
+        self.alert(f"END OF YOUR RUN - ticket {receipt.ticket} was the last free ticket below where you started. The next "
+                   f"slip waits on the card: press Enter to write it to {where} (the first free one of this block), or "
+                   "click a row in Excel and then 'Start at the cell I clicked in Excel', or pick a block.", "fullblock")
+
+    def ticket_freed(self, job):
+        """An Undo freed ``job``'s ticket. While the stack continues from a chosen start, the box goes back to that ticket
+        only if the undone slip is the one the run just passed (nothing free between it and the box), or the last slip of a
+        run that reached the end of its block. An older slip, one of another block or of another workbook, leaves the run
+        where it is."""
+        if self.sink is None or job.sink is not self.sink or job.ticket is None or job.receipt is None:
+            return
+        blk = self.sink.resolve_block(job.receipt.slot.block)
+        if blk is None or blk is not self.sink.resolve_block(self.sel_block):
+            return
+        if self._range_end is job.receipt:
+            self._block_confirm = ""                      # (nothing to hold any more: the undone slip goes back there)
+            self.clear_alert("fullblock")
+            self.continue_at(job.ticket)
+            return
+        if not self.ticket_follow:
+            return
+        nxt = self.sink.next_free_after(blk, job.receipt.row)
+        if nxt is not None and str(nxt.ticket) == self.ticket_var.get().strip():
+            self.continue_at(job.ticket)
 
     def continue_at(self, ticket: int):
         self.set_ticket_text(str(ticket))
         self.ticket_custom = self.ticket_follow = True
+        self._range_end = None
 
     def start_at_cell(self):
-        """Button / F3: the cell selected in Excel is where the next slip goes, and the slips after it follow."""
+        """The button: the cell selected in Excel is where the next slip goes, and the slips after it follow. (No key for
+        it: right after the click in Excel the keyboard belongs to Excel.)"""
         if self.sink is None:
             self.alert("Excel is not connected. Open the workbook, then press 'Connect / reconnect Excel'.")
             return
@@ -910,7 +973,7 @@ class App(tk.Tk):
         self.refresh_blocks()
         if cell is None:
             self.notice("No selected cell to start from: in the workbook connected here, click a ticket or name cell of the "
-                        "row you want to start at, then press F3 again.", "startcell")
+                        "row you want to start at, then click 'Start at the cell I clicked in Excel' again.", "startcell")
             return
         sheet, row, col = cell
         where = f"{sheet} {col_letter(col)}{row}"
@@ -918,12 +981,12 @@ class App(tk.Tk):
         info = next((i for i in self.infos if slot is not None and i.block is slot.block), None)
         if slot is None or info is None:
             self.notice(f"The selected cell ({where}) is not inside a block. Click a ticket or name cell of the row you "
-                        "want to start at, then press F3.", "startcell")
+                        "want to start at, then click 'Start at the cell I clicked in Excel'.", "startcell")
             return
         target = slot if self.sink.is_free(slot) else self.sink.next_free_after(slot.block, slot.row)
         if target is None:
             self.notice(f"{where}: this row and every row below it in the block already have data. Click a row that is "
-                        "still empty, then press F3.", "startcell")
+                        "still empty, then click 'Start at the cell I clicked in Excel'.", "startcell")
             return
         self._block_confirm = ""                          # the operator chose: nothing is left to confirm
         self.clear_alert("fullblock")
@@ -958,6 +1021,7 @@ class App(tk.Tk):
     def select_info(self, info):
         """The operator (or the program, after a full block) picks a block: its suggestion starts from scratch."""
         self.ticket_custom = self.ticket_follow = False
+        self._range_end = None
         self._block_gone = False
         self.clear_alert("block")
         self.sel_block, self.sel_key = info.block, info.block.key
@@ -977,6 +1041,7 @@ class App(tk.Tk):
             self._block_confirm = ""                  # the operator chose: nothing is left to confirm
             self.clear_alert("fullblock")
             self.clear_notice("startcell")
+            self.clear_alert("startcell")
             self.select_info(info)
 
     def expected_jornada(self) -> str:
@@ -1126,6 +1191,8 @@ class App(tk.Tk):
         self.name_entry.configure(state="normal" if on else "readonly")
 
     def clear_card(self):
+        if self.stacked and self.pending is not None:
+            self._mid_canvas.yview_moveto(0)              # (back to the camera picture once the card is done)
         self.pending = None
         self.card_job = None
         self.set_card_enabled(True)
@@ -1203,7 +1270,7 @@ class App(tk.Tk):
             return
         self.open_card(upd)
         if self._block_confirm:
-            self.set_banner("CHECK THIS SLIP - NEW BLOCK, see the red bar", WARN)
+            self.set_banner(self._confirm_banner or "CHECK THIS SLIP - NEW BLOCK, see the red bar", WARN)
 
     def note_slip(self, t_event):
         """A slip was read: count it, and say so when it comes much later than the pace of the stack. A slip the camera
@@ -1357,6 +1424,7 @@ class App(tk.Tk):
         else:
             self.select_info(nxt)
             self._block_confirm = nxt.label
+            self._confirm_banner = ""
             msg = (f"BLOCK FULL - NOT ENTERED: {e}. Press Enter to write this slip to: {nxt.label} - or choose "
                    "another block in the Block list first (a block can belong to another group).")
         self.alert(msg, "fullblock")
@@ -1422,8 +1490,8 @@ class App(tk.Tk):
         self.set_card_enabled(True)
         self.pending = Pending(self._scan_id, rd, hold=hold, timings=dict(upd.timings), fp=upd.fingerprint)
         self._lift_msg = ""
-        self.scroll_mid(False)
         self.show_reading(rd)
+        self.scroll_mid(False)                            # (after the pictures are in: the card has its real size now)
         self.set_banner("CHECK THIS SLIP", WARN)
         self.name_var.set("")
         self.jor_note.set("")
@@ -2058,7 +2126,7 @@ class App(tk.Tk):
         if self.rev_job is job:
             self.on_tree_select()
         job.reading = job.name_crop = job.crop_jpg = None
-        self.ticket_done(freed=job.ticket)
+        self.ticket_freed(job)
         self.refresh_blocks()
         self.update_stats()
 
